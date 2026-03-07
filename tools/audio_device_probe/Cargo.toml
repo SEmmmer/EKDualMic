@@ -1,0 +1,12 @@
+[package]
+name = "audio_device_probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+audio_capture = { path = "../../crates/audio_capture" }
+audio_output = { path = "../../crates/audio_output" }
+common_types = { path = "../../crates/common_types" }

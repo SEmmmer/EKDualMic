@@ -1,0 +1,50 @@
+[node]
+name = "node-a-mock-render"
+listen_addr = "127.0.0.1:38001"
+peer_addr = "127.0.0.1:38002"
+transport_backend = "mock"
+
+[audio]
+backend = "mock"
+input_device = "Mock Microphone"
+sample_rate = 48000
+channels = 1
+frame_ms = 10
+
+[output]
+backend = "virtual_stub"
+target_device = "default"
+wav_path = "artifacts/windows-render/processed-output.wav"
+
+[sync]
+jitter_buffer_frames = 3
+coarse_search_ms = 30
+drift_compensation = true
+
+[cancel]
+filter_length = 1536
+step_size = 0.04
+leakage = 0.0001
+update_threshold = 0.65
+
+[vad]
+enabled = true
+local_threshold = 0.6
+peer_threshold = 0.6
+smoothing = 0.85
+
+[residual]
+enabled = true
+strength = 0.2
+
+[debug]
+dump_wav = true
+dump_metrics = true
+dump_dir = "artifacts/windows-render"
+log_level = "info"
+mock_peer_delay_ms = 20
+mock_peer_gain = 0.35
+
+[gui]
+auto_start = false
+refresh_hz = 30

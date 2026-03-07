@@ -9,7 +9,9 @@ members = [
     "crates/audio_residual",
     "crates/audio_output",
     "crates/app",
+    "tools/audio_device_probe",
     "tools/offline_replay",
+    "tools/runtime_smoke",
     "tools/wav_dump",
 ]
 resolver = "2"

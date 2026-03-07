@@ -155,6 +155,13 @@ impl TransportStats {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct AudioDeviceInfo {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct RuntimeSnapshot {
     pub node_name: String,
     pub sequence: u64,
