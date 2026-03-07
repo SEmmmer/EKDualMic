@@ -1,0 +1,4 @@
+interface:
+  display_name: "EK Dual Mic Maintainer"
+  short_description: "Continue EK Dual Mic and update its records"
+  default_prompt: "Use $ek-dual-mic-maintainer to continue work in EKDualMic and update the project records."

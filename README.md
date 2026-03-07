@@ -29,6 +29,7 @@
 - `docs/completed-work.md`: 当前已完成内容与持续交接记录
 - `docs/windows-test.md`: Windows 端 Codex 的测试流程与预期结果
 - `configs/node-a-mock.toml`: 当前推荐的 mock GUI / Windows 验证配置
+- `skills/ek-dual-mic-maintainer/`: 供后续 Codex 复用的仓库内 skill 源文件
 
 常用命令：
 

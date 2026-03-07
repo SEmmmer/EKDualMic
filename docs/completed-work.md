@@ -85,6 +85,7 @@
 - 增加了 `app` 内部端到端测试，要求 mock 场景里出现 `update_frozen = false`，并在对端单讲阶段出现明显衰减。
 - 增加了持续交接文档 `docs/completed-work.md`、Windows 测试文档 `docs/windows-test.md` 和推荐测试配置 `configs/node-a-mock.toml`。
 - 安装了本地 skill `ek-dual-mic-maintainer`，要求后续 Codex 先读项目说明，再把完成项回写到本文件。
+- 将 `ek-dual-mic-maintainer` 的版本化副本纳入仓库 `skills/ek-dual-mic-maintainer/`，避免 skill 只存在于本机 `~/.codex/skills/`。
 
 验证：
 
@@ -93,6 +94,7 @@
 - `cargo run -q -p offline_replay -- configs/node-a.toml 180`
 - `cargo run -q -p wav_dump -- artifacts/offline/processed-output.wav`
 - `python3 /home/emmmer/.codex/skills/.system/skill-creator/scripts/quick_validate.py /home/emmmer/.codex/skills/ek-dual-mic-maintainer`
+- `python3 /home/emmmer/.codex/skills/.system/skill-creator/scripts/quick_validate.py /home/emmmer/git/EKDualMic/skills/ek-dual-mic-maintainer`
 - `cargo run -q -p offline_replay -- configs/node-a-mock.toml 10`
 
 关键结果：
