@@ -19,7 +19,8 @@
 - 数据流、模块边界、配置结构已建立
 - offline replay 已可作为离线验证入口
 - GUI 只做控制面和指标展示
-- Windows 专用音频 I/O 仍是下一阶段实现项
+- Windows WASAPI capture 与 render-endpoint bridge 已有 MVP，可做单机采集和输出桥接验证
+- 仓库内自带的系统级虚拟麦设备创建、细粒度 drift compensation、以及更深的设备通知/原地恢复仍是后续阶段实现项
 
 ## 主循环
 

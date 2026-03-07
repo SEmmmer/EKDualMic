@@ -12,7 +12,7 @@
 ## `[audio]`
 
 - `backend`: `wasapi` / `mock`
-- `input_device`: 输入设备名
+- `input_device`: 输入设备名；当 `backend = "wasapi"` 时，支持写具体 friendly name，也支持写 `"default"` 以选择当前默认输入设备
 - `sample_rate`: 当前固定为 `48000`
 - `channels`: 当前固定为 `1`
 - `frame_ms`: 当前固定为 `10`
@@ -20,8 +20,8 @@
 ## `[output]`
 
 - `backend`: `virtual_stub` / `wav_dump` / `null`
-- `target_device`: 未来虚拟麦桥接目标
-- `wav_path`: 当输出写到 WAV 时使用的路径
+- `target_device`: 当 `backend = "virtual_stub"` 且运行在 Windows 上时，支持写 render endpoint 的 friendly name，也支持写 `"default"` 选择当前默认输出设备；如果目标是外部虚拟声卡的输入端点（例如 VB-Cable 的 `CABLE Input`），处理后音频会被桥接过去
+- `wav_path`: 当 `backend = "wav_dump"` 时使用；`virtual_stub` 不会写这个路径
 
 ## `[sync]`
 
