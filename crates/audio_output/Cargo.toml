@@ -1,0 +1,12 @@
+[package]
+name = "audio_output"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+common_types = { path = "../common_types" }
+hound.workspace = true
+

@@ -1,0 +1,37 @@
+[workspace]
+members = [
+    "crates/common_types",
+    "crates/audio_capture",
+    "crates/audio_transport",
+    "crates/audio_sync",
+    "crates/audio_vad",
+    "crates/audio_cancel",
+    "crates/audio_residual",
+    "crates/audio_output",
+    "crates/app",
+    "tools/offline_replay",
+    "tools/wav_dump",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+authors = ["OpenAI Codex"]
+
+[workspace.dependencies]
+anyhow = "1.0"
+crossbeam-channel = "0.5"
+eframe = "0.33.3"
+egui = "0.33.3"
+hound = "3.5"
+parking_lot = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+windows = "0.62.2"
+

@@ -1,0 +1,35 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "app"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+audio_cancel = { path = "../audio_cancel" }
+audio_capture = { path = "../audio_capture" }
+audio_output = { path = "../audio_output" }
+audio_residual = { path = "../audio_residual" }
+audio_sync = { path = "../audio_sync" }
+audio_transport = { path = "../audio_transport" }
+audio_vad = { path = "../audio_vad" }
+common_types = { path = "../common_types" }
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+eframe.workspace = true
+egui.workspace = true
+

@@ -1,0 +1,10 @@
+[package]
+name = "audio_vad"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+common_types = { path = "../common_types" }
+
