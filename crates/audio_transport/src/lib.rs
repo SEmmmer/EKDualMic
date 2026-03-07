@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use common_types::{AudioFrame, TransportBackend, TransportStats, VadDecision, now_micros};
 use std::collections::{BTreeMap, VecDeque};
-use std::io::ErrorKind;
+use std::io::{Error, ErrorKind};
 use std::net::UdpSocket;
 
 const HEADER_BYTES: usize = 24;
@@ -121,6 +121,7 @@ impl UdpTransport {
                     }
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) if udp_receive_error_is_transient(&error) => break,
                 Err(error) => return Err(error).context("UDP receive failed"),
             }
         }
@@ -226,4 +227,48 @@ fn decode_packet(payload: &[u8]) -> Option<AudioFrame> {
         sample_rate,
         samples,
     ))
+}
+
+fn udp_receive_error_is_transient(error: &Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::HostUnreachable
+            | ErrorKind::NetworkUnreachable
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn udp_receive_error_is_transient_for_expected_windows_peer_absence_kinds() {
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkUnreachable,
+        ] {
+            let error = Error::new(kind, "transient");
+            assert!(
+                udp_receive_error_is_transient(&error),
+                "expected {kind:?} to be treated as transient"
+            );
+        }
+    }
+
+    #[test]
+    fn udp_receive_error_is_not_transient_for_unexpected_kinds() {
+        for kind in [ErrorKind::TimedOut, ErrorKind::PermissionDenied] {
+            let error = Error::new(kind, "fatal");
+            assert!(
+                !udp_receive_error_is_transient(&error),
+                "expected {kind:?} to remain fatal"
+            );
+        }
+    }
 }
