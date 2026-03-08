@@ -14,6 +14,7 @@ frame_ms = 10
 [output]
 backend = "virtual_stub"
 target_device = "CABLE Input (VB-Audio Virtual Cable)"
+monitor_processed_output = true
 wav_path = "artifacts/node-b/processed-output.wav"
 
 [sync]
@@ -23,9 +24,12 @@ drift_compensation = true
 
 [cancel]
 filter_length = 1536
-step_size = 0.04
+step_size = 0.06
 leakage = 0.0001
-update_threshold = 0.65
+update_threshold = 0.48
+anti_phase_enabled = true
+anti_phase_max_gain = 1.45
+anti_phase_smoothing = 0.72
 
 [vad]
 enabled = true
@@ -35,7 +39,7 @@ smoothing = 0.85
 
 [residual]
 enabled = true
-strength = 0.2
+strength = 0.72
 
 [debug]
 dump_wav = true

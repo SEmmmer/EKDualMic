@@ -7,8 +7,8 @@ use audio_sync::SyncAligner;
 use audio_transport::{TransportLink, build_transport};
 use audio_vad::VoiceActivityDetector;
 use common_types::{
-    AudioBackend, AudioFrame, NodeConfig, RuntimeSnapshot, SAMPLES_PER_FRAME, TransportBackend,
-    TransportStats, VadDecision, now_micros,
+    AudioBackend, AudioFrame, NodeConfig, OutputBackend, RuntimeSnapshot, SAMPLES_PER_FRAME,
+    TransportBackend, TransportStats, VadDecision, now_micros,
 };
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -28,6 +28,7 @@ pub struct PipelineRuntime {
     capture: Box<dyn CaptureSource>,
     transport: Box<dyn TransportLink>,
     uses_integrated_mock_scene: bool,
+    capture_conditioner: CaptureConditioner,
     sync: SyncAligner,
     vad_local: VoiceActivityDetector,
     vad_peer: VoiceActivityDetector,
@@ -41,6 +42,7 @@ pub struct PipelineRuntime {
 impl PipelineRuntime {
     pub fn new(config: NodeConfig) -> Result<Self> {
         let (capture, transport, uses_integrated_mock_scene) = build_pipeline_io(&config)?;
+        let capture_conditioner = CaptureConditioner::default();
         let sync = SyncAligner::new(&config.sync, config.audio.frame_ms as usize);
         let vad_local = VoiceActivityDetector::new(
             config.vad.enabled,
@@ -68,6 +70,7 @@ impl PipelineRuntime {
             capture,
             transport,
             uses_integrated_mock_scene,
+            capture_conditioner,
             sync,
             vad_local,
             vad_peer,
@@ -82,7 +85,8 @@ impl PipelineRuntime {
     pub fn step(&mut self) -> Result<RuntimeSnapshot> {
         let started_at = Instant::now();
 
-        let local_raw = self.capture.read_frame()?;
+        let capture_raw = self.capture.read_frame()?;
+        let local_raw = self.capture_conditioner.process(capture_raw.clone());
         self.transport.send_frame(&local_raw, None)?;
 
         let mut peer_raw = self.transport.recv_or_conceal()?;
@@ -99,19 +103,33 @@ impl PipelineRuntime {
         let peer_vad = self.vad_peer.detect(&peer_aligned);
 
         let allow_update = peer_vad.is_speech
-            && !local_vad.is_speech
-            && sync_report.coherence >= self.config.cancel.update_threshold;
+            && !near_end_dominant(&local_raw, &peer_aligned, local_vad, peer_vad)
+            && sync_report.coherence >= self.config.cancel.update_threshold * 0.85;
         self.cancel.set_update_frozen(!allow_update);
 
         let (canceled, cancel_report) = self.cancel.process(&local_raw, &peer_aligned);
-        let output_frame = self.residual.process(&canceled, local_vad, peer_vad);
-        self.output.write_frame(&output_frame)?;
+        let output_frame = self.residual.process(
+            &canceled,
+            &peer_aligned,
+            local_vad,
+            peer_vad,
+            sync_report.coherence,
+            cancel_report.estimated_crosstalk_rms,
+        );
+        let monitor_frame = if self.config.output.backend == OutputBackend::VirtualStub
+            && !self.config.output.monitor_processed_output
+        {
+            &capture_raw
+        } else {
+            &output_frame
+        };
+        self.output.write_frame(monitor_frame)?;
 
         let transport_stats = self.transport.stats();
         let clip_events = output_frame
             .samples
             .iter()
-            .filter(|sample| sample.abs() > 1.0)
+            .filter(|sample| sample.abs() >= 0.999)
             .count() as u64;
 
         let snapshot = RuntimeSnapshot {
@@ -135,6 +153,7 @@ impl PipelineRuntime {
         };
 
         self.debug.record(
+            &capture_raw,
             &local_raw,
             &peer_raw,
             &peer_aligned,
@@ -155,6 +174,54 @@ impl PipelineRuntime {
         self.debug.finalize()?;
         Ok(())
     }
+}
+
+#[derive(Default)]
+struct CaptureConditioner {
+    emergency_hold_frames: u32,
+}
+
+impl CaptureConditioner {
+    fn process(&mut self, mut frame: AudioFrame) -> AudioFrame {
+        const EMERGENCY_LIMIT_THRESHOLD: f32 = 1.50;
+        const EMERGENCY_TARGET_PEAK: f32 = 0.98;
+        const EMERGENCY_HOLD_FRAMES: u32 = 8;
+
+        let peak = frame
+            .samples
+            .iter()
+            .fold(0.0_f32, |current, sample| current.max(sample.abs()));
+
+        if peak > EMERGENCY_LIMIT_THRESHOLD {
+            self.emergency_hold_frames = EMERGENCY_HOLD_FRAMES;
+        }
+
+        if self.emergency_hold_frames > 0 && peak > 0.0 {
+            let gain = EMERGENCY_TARGET_PEAK / peak.max(EMERGENCY_TARGET_PEAK);
+            for sample in &mut frame.samples {
+                *sample *= gain;
+            }
+            self.emergency_hold_frames -= 1;
+        }
+
+        frame
+    }
+}
+
+fn near_end_dominant(
+    local_raw: &AudioFrame,
+    peer_aligned: &AudioFrame,
+    local_vad: VadDecision,
+    peer_vad: VadDecision,
+) -> bool {
+    if !local_vad.is_speech {
+        return false;
+    }
+
+    let local_rms = local_raw.rms();
+    let peer_rms = peer_aligned.rms().max(1.0e-4);
+    let speech_score_gap = local_vad.score - peer_vad.score;
+    speech_score_gap > 0.18 && local_rms > peer_rms * 1.12
 }
 
 fn build_pipeline_io(
@@ -395,6 +462,7 @@ fn segment_gain(frame_index: u64, start: u64, end: u64) -> f32 {
 }
 
 struct DebugRecorder {
+    capture_raw: Option<WavWriterSink>,
     local_raw: Option<WavWriterSink>,
     peer_raw: Option<WavWriterSink>,
     peer_aligned: Option<WavWriterSink>,
@@ -413,6 +481,14 @@ impl DebugRecorder {
             })?;
         }
 
+        let capture_raw = if config.debug.dump_wav {
+            Some(WavWriterSink::create(default_debug_wav_path(
+                &config.debug.dump_dir,
+                "capture_raw",
+            ))?)
+        } else {
+            None
+        };
         let local_raw = if config.debug.dump_wav {
             Some(WavWriterSink::create(default_debug_wav_path(
                 &config.debug.dump_dir,
@@ -463,6 +539,7 @@ impl DebugRecorder {
         };
 
         Ok(Self {
+            capture_raw,
             local_raw,
             peer_raw,
             peer_aligned,
@@ -473,12 +550,16 @@ impl DebugRecorder {
 
     fn record(
         &mut self,
+        capture_raw: &AudioFrame,
         local_raw: &AudioFrame,
         peer_raw: &AudioFrame,
         peer_aligned: &AudioFrame,
         output: &AudioFrame,
         snapshot: &RuntimeSnapshot,
     ) -> Result<()> {
+        if let Some(writer) = self.capture_raw.as_mut() {
+            writer.write_frame(capture_raw)?;
+        }
         if let Some(writer) = self.local_raw.as_mut() {
             writer.write_frame(local_raw)?;
         }
@@ -516,6 +597,9 @@ impl DebugRecorder {
     }
 
     fn finalize(&mut self) -> Result<()> {
+        if let Some(writer) = self.capture_raw.as_mut() {
+            writer.finalize()?;
+        }
         if let Some(writer) = self.local_raw.as_mut() {
             writer.finalize()?;
         }
@@ -586,6 +670,43 @@ mod tests {
         assert!(
             strong_reduction_frames >= 10,
             "expected repeated peer-only attenuation after convergence, got {strong_reduction_frames} frames"
+        );
+    }
+
+    #[test]
+    fn capture_conditioner_reduces_clipped_samples() {
+        let mut conditioner = CaptureConditioner::default();
+        let frame = AudioFrame::new(1, now_micros(), 48_000, vec![2.0; SAMPLES_PER_FRAME]);
+        let conditioned = conditioner.process(frame);
+        let peak = conditioned
+            .samples
+            .iter()
+            .fold(0.0_f32, |current, sample| current.max(sample.abs()));
+        assert!(
+            peak < 0.99,
+            "expected conditioner to reduce peak, got {peak}"
+        );
+    }
+
+    #[test]
+    fn near_end_dominance_allows_peer_only_leakage_updates() {
+        let local = AudioFrame::new(1, now_micros(), 48_000, vec![0.08; SAMPLES_PER_FRAME]);
+        let peer = AudioFrame::new(1, now_micros(), 48_000, vec![0.09; SAMPLES_PER_FRAME]);
+
+        assert!(
+            !near_end_dominant(
+                &local,
+                &peer,
+                VadDecision {
+                    score: 0.7,
+                    is_speech: true,
+                },
+                VadDecision {
+                    score: 0.9,
+                    is_speech: true,
+                },
+            ),
+            "peer-dominant leakage should still allow adaptive updates"
         );
     }
 }

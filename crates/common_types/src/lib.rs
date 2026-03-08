@@ -284,6 +284,7 @@ impl Default for AudioConfig {
 pub struct OutputConfig {
     pub backend: OutputBackend,
     pub target_device: String,
+    pub monitor_processed_output: bool,
     pub wav_path: PathBuf,
 }
 
@@ -292,6 +293,7 @@ impl Default for OutputConfig {
         Self {
             backend: OutputBackend::VirtualStub,
             target_device: "Processed Mic".to_owned(),
+            monitor_processed_output: true,
             wav_path: PathBuf::from("artifacts/output.wav"),
         }
     }
@@ -322,15 +324,21 @@ pub struct CancelConfig {
     pub step_size: f32,
     pub leakage: f32,
     pub update_threshold: f32,
+    pub anti_phase_enabled: bool,
+    pub anti_phase_max_gain: f32,
+    pub anti_phase_smoothing: f32,
 }
 
 impl Default for CancelConfig {
     fn default() -> Self {
         Self {
             filter_length: 1_536,
-            step_size: 0.04,
+            step_size: 0.06,
             leakage: 0.0001,
-            update_threshold: 0.65,
+            update_threshold: 0.48,
+            anti_phase_enabled: true,
+            anti_phase_max_gain: 1.45,
+            anti_phase_smoothing: 0.72,
         }
     }
 }
@@ -366,7 +374,7 @@ impl Default for ResidualConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            strength: 0.2,
+            strength: 0.72,
         }
     }
 }

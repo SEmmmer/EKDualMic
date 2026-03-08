@@ -1,6 +1,6 @@
 [node]
 name = "node-a-mock-render"
-listen_addr = "127.0.0.1:38001"
+listen_addr = "0.0.0.0:38001"
 peer_addr = "127.0.0.1:38002"
 transport_backend = "mock"
 
@@ -14,6 +14,7 @@ frame_ms = 10
 [output]
 backend = "virtual_stub"
 target_device = "default"
+monitor_processed_output = true
 wav_path = "artifacts/windows-render/processed-output.wav"
 
 [sync]
@@ -23,9 +24,12 @@ drift_compensation = true
 
 [cancel]
 filter_length = 1536
-step_size = 0.04
+step_size = 0.06
 leakage = 0.0001
-update_threshold = 0.65
+update_threshold = 0.48
+anti_phase_enabled = true
+anti_phase_max_gain = 1.45
+anti_phase_smoothing = 0.72
 
 [vad]
 enabled = true
@@ -35,7 +39,7 @@ smoothing = 0.85
 
 [residual]
 enabled = true
-strength = 0.2
+strength = 0.72
 
 [debug]
 dump_wav = true

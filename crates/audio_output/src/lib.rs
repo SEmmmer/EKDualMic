@@ -19,10 +19,11 @@ use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::Media::Audio::{
     AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
     AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, DEVICE_STATE_ACTIVE, IAudioClient, IAudioRenderClient,
-    IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX, eConsole, eRender,
+    IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, WAVE_FORMAT_PCM, WAVEFORMATEX,
+    WAVEFORMATEXTENSIBLE, eConsole, eRender,
 };
 #[cfg(windows)]
-use windows::Win32::Media::Multimedia::WAVE_FORMAT_IEEE_FLOAT;
+use windows::Win32::Media::Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT};
 #[cfg(windows)]
 use windows::Win32::System::Com::StructuredStorage::{
     PROPVARIANT, PropVariantClear, PropVariantToStringAlloc,
@@ -133,8 +134,31 @@ pub struct WindowsRenderSink {
     audio_client: IAudioClient,
     render_client: IAudioRenderClient,
     buffer_frames: u32,
+    render_spec: RenderFormatSpec,
     com_initialized: bool,
 }
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+struct RenderFormatSpec {
+    channels: u16,
+    sample_rate: u32,
+    block_align: u16,
+    sample_format: RenderSampleFormat,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+enum RenderSampleFormat {
+    Float32,
+    Pcm16,
+    Pcm24,
+    Pcm32,
+}
+
+#[cfg(windows)]
+const KSDATAFORMAT_SUBTYPE_PCM_GUID: windows::core::GUID =
+    windows::core::GUID::from_u128(0x00000001_0000_0010_8000_00aa00389b71);
 
 #[cfg(windows)]
 impl WindowsRenderSink {
@@ -158,18 +182,15 @@ impl WindowsRenderSink {
                     .with_context(|| format!("failed to activate render device `{device_name}`"))?
             };
 
-            let mut render_format = WAVEFORMATEX {
-                wFormatTag: WAVE_FORMAT_IEEE_FLOAT as u16,
-                nChannels: CHANNELS as u16,
-                nSamplesPerSec: SAMPLE_RATE_HZ,
-                nAvgBytesPerSec: SAMPLE_RATE_HZ * 4,
-                nBlockAlign: 4,
-                wBitsPerSample: 32,
-                cbSize: 0,
+            let mix_format_ptr = unsafe { audio_client.GetMixFormat() }
+                .context("failed to query WASAPI render mix format")?;
+            let render_spec = describe_render_format(unsafe { &*mix_format_ptr })?;
+            let buffer_duration_hns = 10_000_000_i64;
+            let stream_flags = if render_spec.sample_rate == SAMPLE_RATE_HZ {
+                AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
+            } else {
+                Default::default()
             };
-            let buffer_duration_hns = frame_count_to_hns(480 * 4);
-            let stream_flags =
-                AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
 
             unsafe {
                 audio_client.Initialize(
@@ -177,15 +198,19 @@ impl WindowsRenderSink {
                     stream_flags,
                     buffer_duration_hns,
                     0,
-                    &mut render_format,
+                    mix_format_ptr,
                     None,
                 )
             }
             .with_context(|| {
                 format!(
-                    "failed to initialize WASAPI render for `{device_name}` with 48 kHz mono float32"
+                    "failed to initialize WASAPI render for `{device_name}` with device mix format {} Hz, {} channels, {:?}",
+                    render_spec.sample_rate,
+                    render_spec.channels,
+                    render_spec.sample_format
                 )
             })?;
+            unsafe { CoTaskMemFree(Some(mix_format_ptr.cast())) };
 
             let render_client = unsafe {
                 audio_client
@@ -195,6 +220,11 @@ impl WindowsRenderSink {
             let buffer_frames = unsafe { audio_client.GetBufferSize() }
                 .context("failed to query WASAPI render buffer size")?;
 
+            prime_render_buffer_with_silence(
+                &render_client,
+                buffer_frames,
+                render_spec.block_align,
+            )?;
             unsafe { audio_client.Start() }.context("failed to start WASAPI render stream")?;
 
             Ok(Self {
@@ -202,6 +232,7 @@ impl WindowsRenderSink {
                 audio_client,
                 render_client,
                 buffer_frames,
+                render_spec,
                 com_initialized,
             })
         })();
@@ -247,6 +278,8 @@ fn init_com_for_output(context: &str) -> Result<bool> {
 #[cfg(windows)]
 impl OutputSink for WindowsRenderSink {
     fn write_frame(&mut self, frame: &AudioFrame) -> Result<()> {
+        const LIVE_OUTPUT_GAIN: f32 = 1.0;
+
         if frame.sample_rate != SAMPLE_RATE_HZ {
             anyhow::bail!(
                 "WASAPI output currently requires sample_rate={} but got {}",
@@ -255,7 +288,22 @@ impl OutputSink for WindowsRenderSink {
             );
         }
 
-        let requested_frames = (frame.samples.len() / CHANNELS) as u32;
+        let source_frames = frame.samples.len() / CHANNELS;
+        let mono_samples = if self.render_spec.sample_rate == SAMPLE_RATE_HZ {
+            frame.samples.clone()
+        } else {
+            resample_mono_frame(
+                &frame.samples,
+                source_frames,
+                self.render_spec.sample_rate,
+                SAMPLE_RATE_HZ,
+            )
+        };
+        let mono_samples = mono_samples
+            .into_iter()
+            .map(|sample| soft_limit_monitor(sample * LIVE_OUTPUT_GAIN))
+            .collect::<Vec<_>>();
+        let requested_frames = mono_samples.len() as u32;
         self.wait_for_available_frames(requested_frames)?;
 
         let data = unsafe { self.render_client.GetBuffer(requested_frames) }
@@ -264,9 +312,9 @@ impl OutputSink for WindowsRenderSink {
             anyhow::bail!("WASAPI render returned a null buffer");
         }
 
-        let sample_count = requested_frames as usize * CHANNELS;
-        let destination = unsafe { std::slice::from_raw_parts_mut(data as *mut f32, sample_count) };
-        destination.copy_from_slice(&frame.samples[..sample_count]);
+        let byte_count = requested_frames as usize * self.render_spec.block_align as usize;
+        let destination = unsafe { std::slice::from_raw_parts_mut(data as *mut u8, byte_count) };
+        write_mono_frame_to_output_buffer(destination, &mono_samples, self.render_spec);
 
         unsafe { self.render_client.ReleaseBuffer(requested_frames, 0) }
             .context("failed to release WASAPI render buffer")?;
@@ -351,8 +399,146 @@ fn render_device_id(device: &IMMDevice) -> Result<String> {
 }
 
 #[cfg(windows)]
-fn frame_count_to_hns(frame_count: u32) -> i64 {
-    (10_000_000_i64 * frame_count as i64) / SAMPLE_RATE_HZ as i64
+fn prime_render_buffer_with_silence(
+    render_client: &IAudioRenderClient,
+    buffer_frames: u32,
+    block_align: u16,
+) -> Result<()> {
+    if buffer_frames == 0 {
+        return Ok(());
+    }
+
+    let data = unsafe { render_client.GetBuffer(buffer_frames) }
+        .context("failed to acquire initial WASAPI render buffer")?;
+    if data.is_null() {
+        anyhow::bail!("WASAPI render returned a null buffer during initial priming");
+    }
+
+    let byte_count = buffer_frames as usize * block_align as usize;
+    let destination = unsafe { std::slice::from_raw_parts_mut(data as *mut u8, byte_count) };
+    destination.fill(0);
+
+    unsafe { render_client.ReleaseBuffer(buffer_frames, 0) }
+        .context("failed to release initial WASAPI render buffer")?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn describe_render_format(format: &WAVEFORMATEX) -> Result<RenderFormatSpec> {
+    const WAVE_FORMAT_EXTENSIBLE_TAG: u16 = 0xFFFE;
+
+    let channels = unsafe { std::ptr::addr_of!(format.nChannels).read_unaligned() }.max(1);
+    let sample_rate = unsafe { std::ptr::addr_of!(format.nSamplesPerSec).read_unaligned() }.max(1);
+    let block_align = unsafe { std::ptr::addr_of!(format.nBlockAlign).read_unaligned() }.max(1);
+    let format_tag = unsafe { std::ptr::addr_of!(format.wFormatTag).read_unaligned() };
+    let bits_per_sample = unsafe { std::ptr::addr_of!(format.wBitsPerSample).read_unaligned() };
+
+    let sample_format = match format_tag {
+        value if value == WAVE_FORMAT_IEEE_FLOAT as u16 => RenderSampleFormat::Float32,
+        value if value == WAVE_FORMAT_PCM as u16 => pcm_format_from_bits(bits_per_sample)?,
+        WAVE_FORMAT_EXTENSIBLE_TAG => {
+            let extensible =
+                unsafe { &*(format as *const WAVEFORMATEX as *const WAVEFORMATEXTENSIBLE) };
+            let sub_format = unsafe { std::ptr::addr_of!(extensible.SubFormat).read_unaligned() };
+            if sub_format == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT {
+                RenderSampleFormat::Float32
+            } else if sub_format == KSDATAFORMAT_SUBTYPE_PCM_GUID {
+                pcm_format_from_bits(bits_per_sample)?
+            } else {
+                anyhow::bail!("unsupported WASAPI render sub-format {:?}", sub_format);
+            }
+        }
+        other => anyhow::bail!("unsupported WASAPI render format tag {other}"),
+    };
+
+    Ok(RenderFormatSpec {
+        channels,
+        sample_rate,
+        block_align,
+        sample_format,
+    })
+}
+
+#[cfg(windows)]
+fn pcm_format_from_bits(bits_per_sample: u16) -> Result<RenderSampleFormat> {
+    match bits_per_sample {
+        16 => Ok(RenderSampleFormat::Pcm16),
+        24 => Ok(RenderSampleFormat::Pcm24),
+        32 => Ok(RenderSampleFormat::Pcm32),
+        other => anyhow::bail!("unsupported PCM render bit depth {other}"),
+    }
+}
+
+fn resample_mono_frame(
+    mono_samples: &[f32],
+    input_frames: usize,
+    output_sample_rate: u32,
+    input_sample_rate: u32,
+) -> Vec<f32> {
+    if output_sample_rate == input_sample_rate || input_frames <= 1 {
+        return mono_samples.to_vec();
+    }
+
+    let output_frames = ((input_frames as u64 * output_sample_rate as u64)
+        / input_sample_rate as u64)
+        .max(1) as usize;
+    let ratio = input_sample_rate as f32 / output_sample_rate as f32;
+    let mut output = Vec::with_capacity(output_frames);
+    for output_index in 0..output_frames {
+        let source_position = output_index as f32 * ratio;
+        let left_index = source_position.floor() as usize;
+        let right_index = (left_index + 1).min(mono_samples.len().saturating_sub(1));
+        let fraction = source_position - left_index as f32;
+        let left = mono_samples[left_index.min(mono_samples.len().saturating_sub(1))];
+        let right = mono_samples[right_index];
+        output.push(left + (right - left) * fraction);
+    }
+    output
+}
+
+fn write_mono_frame_to_output_buffer(
+    destination: &mut [u8],
+    mono_samples: &[f32],
+    format: RenderFormatSpec,
+) {
+    let channel_count = format.channels as usize;
+    let bytes_per_sample = (format.block_align as usize / channel_count.max(1)).max(1);
+    let frame_count = destination.len() / format.block_align as usize;
+
+    for frame_index in 0..frame_count {
+        let sample = mono_samples
+            .get(frame_index)
+            .copied()
+            .unwrap_or(0.0)
+            .clamp(-1.0, 1.0);
+        for channel_index in 0..channel_count {
+            let byte_offset =
+                frame_index * format.block_align as usize + channel_index * bytes_per_sample;
+            match format.sample_format {
+                RenderSampleFormat::Float32 => {
+                    destination[byte_offset..byte_offset + 4]
+                        .copy_from_slice(&sample.to_le_bytes());
+                }
+                RenderSampleFormat::Pcm16 => {
+                    let value = (sample * i16::MAX as f32).round() as i16;
+                    destination[byte_offset..byte_offset + 2].copy_from_slice(&value.to_le_bytes());
+                }
+                RenderSampleFormat::Pcm24 => {
+                    let value = (sample * 8_388_607.0).round() as i32;
+                    let bytes = value.to_le_bytes();
+                    destination[byte_offset..byte_offset + 3].copy_from_slice(&bytes[..3]);
+                }
+                RenderSampleFormat::Pcm32 => {
+                    let value = (sample * i32::MAX as f32).round() as i32;
+                    destination[byte_offset..byte_offset + 4].copy_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+    }
+}
+
+fn soft_limit_monitor(sample: f32) -> f32 {
+    sample.clamp(-1.0, 1.0)
 }
 
 pub struct WavWriterSink {
@@ -407,4 +593,64 @@ impl OutputSink for WavWriterSink {
 
 pub fn default_debug_wav_path(base_dir: &Path, stem: &str) -> PathBuf {
     base_dir.join(format!("{stem}.wav"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_mono_frame_duplicates_samples_across_channels() {
+        let mut destination = vec![0_u8; 24];
+        write_mono_frame_to_output_buffer(
+            &mut destination,
+            &[0.25, -0.5],
+            RenderFormatSpec {
+                channels: 3,
+                sample_rate: SAMPLE_RATE_HZ,
+                block_align: 12,
+                sample_format: RenderSampleFormat::Float32,
+            },
+        );
+
+        let samples = destination
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("chunk should be 4 bytes")))
+            .collect::<Vec<_>>();
+        assert_eq!(samples, vec![0.25, 0.25, 0.25, -0.5, -0.5, -0.5]);
+    }
+
+    #[test]
+    fn write_mono_frame_zero_fills_tail_when_destination_is_larger() {
+        let mut destination = vec![255_u8; 16];
+        write_mono_frame_to_output_buffer(
+            &mut destination,
+            &[0.2],
+            RenderFormatSpec {
+                channels: 2,
+                sample_rate: SAMPLE_RATE_HZ,
+                block_align: 8,
+                sample_format: RenderSampleFormat::Float32,
+            },
+        );
+
+        let samples = destination
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("chunk should be 4 bytes")))
+            .collect::<Vec<_>>();
+        assert_eq!(samples, vec![0.2, 0.2, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn resample_mono_frame_changes_frame_count_for_non_48k_output() {
+        let input = vec![0.0; 480];
+        let output = resample_mono_frame(&input, 480, 44_100, 48_000);
+        assert_eq!(output.len(), 441);
+    }
+
+    #[test]
+    fn soft_limit_monitor_caps_hot_samples_without_silencing_them() {
+        let sample = soft_limit_monitor(1.6);
+        assert_eq!(sample, 1.0);
+    }
 }

@@ -6,6 +6,10 @@ pub struct NlmsCanceller {
     cursor: usize,
     step_size: f32,
     leakage: f32,
+    anti_phase_enabled: bool,
+    anti_phase_gain: f32,
+    anti_phase_max_gain: f32,
+    anti_phase_smoothing: f32,
     update_frozen: bool,
     last_report: CancelReport,
 }
@@ -19,6 +23,10 @@ impl NlmsCanceller {
             cursor: 0,
             step_size: config.step_size,
             leakage: config.leakage,
+            anti_phase_enabled: config.anti_phase_enabled,
+            anti_phase_gain: 0.0,
+            anti_phase_max_gain: config.anti_phase_max_gain.clamp(0.0, 2.0),
+            anti_phase_smoothing: config.anti_phase_smoothing.clamp(0.0, 0.999),
             update_frozen: false,
             last_report: CancelReport::default(),
         }
@@ -36,6 +44,7 @@ impl NlmsCanceller {
         self.weights.fill(0.0);
         self.history.fill(0.0);
         self.cursor = 0;
+        self.anti_phase_gain = 0.0;
         self.last_report = CancelReport::default();
     }
 
@@ -44,6 +53,18 @@ impl NlmsCanceller {
         local_raw: &AudioFrame,
         peer_aligned: &AudioFrame,
     ) -> (AudioFrame, CancelReport) {
+        let frame_direct_gain = if self.anti_phase_enabled {
+            estimate_direct_gain(local_raw, peer_aligned, self.anti_phase_max_gain)
+        } else {
+            0.0
+        };
+        self.update_anti_phase_gain(frame_direct_gain);
+        let anti_phase_gain = if self.anti_phase_enabled {
+            self.anti_phase_gain
+        } else {
+            0.0
+        };
+
         let mut output = Vec::with_capacity(local_raw.samples.len());
         let mut estimate = Vec::with_capacity(local_raw.samples.len());
 
@@ -69,9 +90,11 @@ impl NlmsCanceller {
                 }
             }
 
-            let error = local_sample - predicted;
+            let direct_prediction = anti_phase_gain * peer_sample;
+            let total_prediction = predicted + direct_prediction;
+            let error = local_sample - total_prediction;
             output.push(error);
-            estimate.push(predicted);
+            estimate.push(total_prediction);
 
             if !self.update_frozen {
                 let adaptation = self.step_size / energy;
@@ -111,5 +134,70 @@ impl NlmsCanceller {
 
     pub fn last_report(&self) -> CancelReport {
         self.last_report
+    }
+
+    fn update_anti_phase_gain(&mut self, target_gain: f32) {
+        if !self.anti_phase_enabled {
+            self.anti_phase_gain = 0.0;
+            return;
+        }
+
+        let target_gain = target_gain.clamp(0.0, self.anti_phase_max_gain);
+        let smoothed_gain = self.anti_phase_gain * self.anti_phase_smoothing
+            + target_gain * (1.0 - self.anti_phase_smoothing);
+
+        if self.update_frozen && smoothed_gain > self.anti_phase_gain {
+            return;
+        }
+
+        self.anti_phase_gain = smoothed_gain;
+    }
+}
+
+fn estimate_direct_gain(local_raw: &AudioFrame, peer_aligned: &AudioFrame, max_gain: f32) -> f32 {
+    let mut cross = 0.0_f64;
+    let mut energy = 1.0e-6_f64;
+
+    for (&local_sample, &peer_sample) in local_raw.samples.iter().zip(peer_aligned.samples.iter()) {
+        cross += (local_sample as f64) * (peer_sample as f64);
+        energy += (peer_sample as f64) * (peer_sample as f64);
+    }
+
+    let gain = (cross / energy).max(0.0) as f32;
+    gain.clamp(0.0, max_gain)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common_types::now_micros;
+
+    #[test]
+    fn direct_gain_estimator_tracks_scaled_peer() {
+        let local = AudioFrame::new(1, now_micros(), 48_000, vec![0.3; 480]);
+        let peer = AudioFrame::new(1, now_micros(), 48_000, vec![0.2; 480]);
+        let gain = estimate_direct_gain(&local, &peer, 2.0);
+        assert!(
+            (gain - 1.5).abs() < 0.02,
+            "expected gain near 1.5, got {gain}"
+        );
+    }
+
+    #[test]
+    fn anti_phase_path_reduces_simple_leakage_after_convergence() {
+        let mut canceller = NlmsCanceller::new(&CancelConfig::default());
+        let local = AudioFrame::new(1, now_micros(), 48_000, vec![0.24; 480]);
+        let peer = AudioFrame::new(1, now_micros(), 48_000, vec![0.2; 480]);
+
+        let mut final_output_rms = 1.0;
+        for _ in 0..24 {
+            let (output, _) = canceller.process(&local, &peer);
+            final_output_rms = output.rms();
+        }
+
+        assert!(
+            final_output_rms < local.rms() * 0.4,
+            "expected anti-phase + NLMS to reduce leakage, got {final_output_rms}"
+        );
     }
 }
