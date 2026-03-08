@@ -529,3 +529,419 @@
 
 - 当前 transport 容错只覆盖了一组常见的无 peer UDP 错误；如果未来出现其它 Windows 特定 socket 错误，仍需要继续补充分类。
 - 真实双机 UDP 联调仍未完成；这里只修复了单机 capture smoke / GUI 验证路径。
+
+### 2026-03-08（GUI 支持双机 IP 互连配置）
+
+- 为 `crates/app/src/gui.rs` 增加了 `Local Listen Address` 和 `Peer Address` 表单字段，并把它们接入 `Load Config` / `Load Current Path` / `Start` / `Save Runtime Fields` 的整条持久化路径；现在不需要手改 TOML，也能在 GUI 中直接完成双机按 IP 互连的配置。
+- 运行时表单保存逻辑已从“只保存设备字段”升级为“同时保存设备字段和网络字段”；当前点击 `Start` 时也会先把界面里的 `listen_addr` / `peer_addr` 同步回配置，再启动 runtime。
+- 对输入做了轻量归一化：如果在 GUI 的 `Peer Address` 或 `Local Listen Address` 中只输入纯 IP，例如 `192.168.1.22`，保存时会自动沿用该配置原有的端口，例如补成 `192.168.1.22:38001`。
+- 为 GUI 增加了 transport backend 语义：当当前配置使用 `transport_backend = "mock"` 时，会明确提示网络地址字段被忽略，并禁用这两个字段，避免把 mock 场景误认为真实双机 UDP。
+- 在 `crates/app/src/config.rs` 为 UDP 配置增加了前置校验：`node.listen_addr` 和 `node.peer_addr` 现在必须是合法的 `IP:port`，并且端口不能为 `0`，这样地址错误会在加载/保存配置时被直接指出，而不是等到 runtime bind/send 阶段才暴露。
+- 更新了 `README.md`、`docs/config.md`、`docs/windows-test.md` 和 repo skill，写回了推荐双机局域网用法：两边都监听 `0.0.0.0:38001`，并把 `peer_addr` 指向对端机器的 `IP:38001`。
+
+验证：
+
+- `cargo fmt --all`
+- `cargo check -p app`
+- `cargo test -p app`
+
+关键结果：
+
+- GUI 现在已经具备“按 IP 配置双机互连”的 operator 入口，transport 底层不再只是由仓库内预设 TOML 间接驱动。
+- 新增测试覆盖了：配置重新加载会把网络字段带回 UI；保存 runtime 字段时会把纯 IP 自动补全为带端口的地址；UDP 地址格式校验可以直接拦截非法输入。
+
+仍未完成：
+
+- 我这里还没有做两台真实 Windows 机器的人工端到端联调，因此“配置入口已经打通”不等于“双机语音效果已验收完成”。
+- 当前 GUI 仍然要求手工知道对端机器 IP；还没有设备发现、广播配对或二维码之类的发现机制。
+
+### 2026-03-08（Realtime Metrics 默认四列并支持尺寸切换）
+
+- 按最新反馈继续收紧了 `crates/app/src/gui.rs` 的 metrics 区布局：`Realtime Metrics` 标题旁新增 `Metrics Size` 按钮组，提供 `Small`、`Medium`、`Large` 三档视图切换。
+- 默认档位现在是 `Small`，会把 4 个指标面板压缩成一行 4 个，同时减小状态卡高度、图表高度和进度条高度，避免 metrics 区继续占掉过多垂直空间。
+- `Medium` 会回到 2 列面板，`Large` 会进一步放大到 1 列面板，方便在大字体或排障时查看单个图表细节。
+- 为 GUI 测试增加了默认布局断言，确认默认启动时 `metrics_panel_size = Compact` 且 metrics 区使用 4 列布局。
+- 同步更新了 `README.md` 和 `docs/windows-test.md`，把“默认 Small 模式下一行 4 个面板”和“支持尺寸切换按钮”写回说明。
+
+验证：
+
+- `cargo fmt --all`
+- `cargo check -p app`
+- `cargo test -p app`
+- `cargo build --workspace --release`
+
+关键结果：
+
+- metrics 区默认布局现在从“2 个大面板一行”变成“4 个小面板一行”，更适合在当前 GUI 窗口宽度下同时观察所有关键指标。
+- 现有 metrics 渲染测试与新增默认布局测试都通过，说明这次缩小和重排没有重新引入 `NaN` 几何问题。
+
+仍未完成：
+
+- 当前尺寸切换只改变面板列数和主要可视化尺寸，还没有做自由拖拽缩放或持久化用户偏好。
+
+### 2026-03-08（GUI i18n 与顶部语言菜单）
+
+- 在 `crates/app/src/gui.rs` 中为 GUI 增加了轻量 i18n 支持，当前覆盖 English / 中文 两种界面语言。
+- 顶部区域已从简单标题条改成菜单栏，新增 `Language` / `语言` 菜单，可在 `English` 与 `中文` 之间即时切换。
+- 当前翻译范围覆盖了：顶栏、配置区按钮与提示、设备区标题、状态文本前缀、`Realtime Metrics` 标题与尺寸按钮、以及主要指标卡片/图表标签。
+- 当前没有修改日志与底层错误链的语言；GUI 里动态错误详情仍可能保留英文，因为底层 anyhow/OS 错误本身就是英文。
+- 同步更新了 `README.md` 和 `docs/windows-test.md`，把顶部菜单栏和双语切换写回交接资料。
+
+验证：
+
+- `cargo fmt --all`
+- `cargo check -p app`
+- `cargo test -p app`
+- `cargo build --workspace --release`
+
+关键结果：
+
+- GUI 现在可以在不重启进程的情况下切换中英文界面。
+- 新增的语言测试确认默认语言仍是 English，同时已具备中文核心标签和 metrics 尺寸按钮翻译。
+
+仍未完成：
+
+- 当前语言选择还没有持久化到配置文件，重启后会回到默认中文。
+- 详细错误消息仍以底层英文 error chain 为主，没有单独做中文错误映射。
+
+### 2026-03-08（GUI 默认语言切换为中文）
+
+- 按最新操作习惯，把 `crates/app/src/gui.rs` 中 GUI 的默认 `UiLanguage` 从 English 改成了中文。
+- `NodeGuiApp::default()` 和测试辅助构造也同步切到中文默认，避免测试仍然假定英文初始态。
+- 当前顶部菜单里的语言切换逻辑没有变；只是首次打开 GUI 时不再先显示英文。
+
+验证：
+
+- `cargo test -p app`
+- `cargo build --workspace --release`
+
+关键结果：
+
+- 新启动的 GUI 默认就是中文界面，仍然可以随时切回 English。
+
+### 2026-03-08（改成系统字体链，不打包字体资源）
+
+- 按最新要求，`crates/app/src/gui.rs` 的 Windows CJK 字体逻辑已改成只在运行时读取系统字体文件，不再依赖任何仓库内或编译期打包的字体资源。
+- 当前 regular 文本的优先级链是：`NotoSansSC-VF.ttf`（思源黑体）优先，其次 `msyh.ttc`（微软雅黑），再退到 `simhei.ttf` / `simsun.ttc` 等其他系统字体。
+- `Start` 按钮单独切到 bold 家族，当前优先使用系统里的 `msyhbd.ttc`；如果该字体不可用，再退回其他同机可用的 CJK 字体。
+- 这意味着最终生成的 `app.exe` 仍然是单文件应用，不会额外把字体资源编进包里；字体完全取决于目标 Windows 机器本身的 `C:\Windows\Fonts`。
+
+验证：
+
+- `cargo test -p app`
+- `cargo build --workspace --release`
+
+### 2026-03-08（内置默认配置预设与设备下拉选择）
+
+- 为 `crates/app/src/config.rs` 增加了内置配置预设回退：`node-a.toml`、`node-b.toml`、`node-a-mock.toml`、`node-a-wasapi-wav.toml`、`node-a-mock-render.toml` 现在都会被编进二进制。即使把 `app.exe` 单独带走、外部没有仓库 `configs/` 目录，GUI 仍可直接加载这些常用预设。
+- `discover_config_presets()` 现在在找不到 workspace 时会返回内置预设列表；`load_config()` 在磁盘读取失败但命中已知预设名时，会自动回退到编译进 exe 的配置文本。
+- `save_config()` 现在会自动创建父目录，因此便携模式下首次保存 `configs/node-a.toml` 这类路径时，不再要求外部先手工建好 `configs/` 目录。
+- 相对 `wav_path` / `dump_dir` / `logs/` 的默认落点也收敛到了“优先 workspace 根目录，否则 exe 所在目录”，避免脱离仓库后把运行产物意外写到别的当前工作目录。
+- 在 `crates/app/src/gui.rs` 中把 `Audio Input Device` / `Output Target Device` 从纯文本输入改成了下拉菜单；当前会直接列出默认输入/输出以及已探测到的设备 friendly name，减少手输设备名导致的启动错误。
+- `README.md`、`docs/windows-test.md`、repo skill 以及本交接文档已同步说明：当前 `app.exe` 已具备“内置默认配置预设 + 首次保存自动落盘”的便携基础，但运行日志和调试产物仍然会写到 exe 旁边或 workspace 下的外部目录。
+
+验证：
+
+- `cargo fmt --all`
+- `cargo check -p app`
+- `cargo test -p app`
+- `cargo build --workspace --release`
+
+关键结果：
+
+- 当前 GUI 已不再强依赖仓库外部的 `configs/` 目录，单个 `app.exe` 可以直接带走并用内置预设启动。
+- 设备选择入口从“文本输入 + 下方设备列表”变成了更直接的下拉选择，operator 路径更短。
+
+仍未完成：
+
+- 目前内置的是默认配置预设，不包含自定义用户配置；用户修改后的配置仍会以外部 TOML 文件形式落盘。
+- `audio_device_probe`、`runtime_smoke` 等工具仍然是独立可执行文件，没有一起合并进单个 `app.exe`。
+
+### 2026-03-08（配置文件夹导入、去重与冲突重命名）
+
+- 按最新 operator 需求，`crates/app/src/gui.rs` 里的 `Load Current Path` 已移除，改成 `Import Config Folder`。点击后会直接打开 Windows 文件夹选择界面，用户只需选中一个 config 文件夹，就会批量扫描其中的 `.toml` 配置文件。
+- 在 `crates/app/src/config.rs` 增加了配置导入预览和实际导入逻辑。当前会把所选文件夹中的 `.toml` 与现有本地配置和内置预设一起比较，执行两级去重：
+  - 如果内容与任意已有配置完全一致，则直接跳过，不重复导入。
+  - 如果文件名相同但内容不同，则先生成冲突预览并在 GUI 中警告用户。
+- 用户确认导入冲突项后，系统会自动做稳定的后缀重命名，例如 `node-a.toml -> node-a-1.toml`；若原文件已经是 `node-a-1.toml`，则继续变成 `node-a-2.toml`，不会出现 `node-a-1-1.toml` 这种嵌套后缀。
+- 导入成功后，GUI 会刷新 `Load Config` 预设列表，并把首个新导入的配置设为当前 `Config Path` 后重新装载；同时会在配置反馈区显示导入、去重、重命名、跳过的摘要。
+- 为此新增了 `rfd` 依赖，用于在 Windows 上弹出原生文件夹选择对话框。
+
+验证：
+
+- `cargo check -p app`
+- `cargo test -p app`
+- `cargo build --workspace --release`
+
+关键结果：
+
+- GUI 现在已经支持“从外部 config 文件夹批量导入配置”而不是只能手写单个路径。
+- 导入时的去重和冲突重命名规则已经有单元测试覆盖，包含 `name -> name-1 -> name-2` 递增，而不是 `name-1-1`。
+
+仍未完成：
+
+- 当前冲突确认是 GUI 内部弹窗，不会把 diff 逐字段展示给用户；它只展示来源文件名、已有路径和建议重命名结果。
+
+### 2026-03-08（WASAPI render mix format 修正与 Recording Test tab）
+
+- 根据最新日志 `app-4940-1772943246.log`，当前 `virtual_stub` 场景的失败点已经明确：runtime 不是卡在 capture，而是卡在 `audio_output` 初始化阶段。日志连续出现 `failed to initialize WASAPI render for '扬声器 (PRO X 2 LIGHTSPEED)' ... 参数错误 (0x80070057)`，说明目标 render endpoint 不接受旧实现强塞的自定义共享模式格式。
+- 在 `crates/audio_output/src/lib.rs` 中把 Windows render 初始化从“手工构造固定的 `48 kHz / float32 / 自定义通道数` `WAVEFORMATEX`”改成了“读取设备实际 mix format 并按其格式建流”。当前同时支持常见的 `float32`、`PCM16`、`PCM24`、`PCM32` 输出写入。
+- 输出写入路径也同步增强：会把内部 `48 kHz / mono / float32` 帧按设备实际采样率做轻量重采样，并按目标声道数复制 / 交织到设备 buffer 中，而不是继续把单声道 `f32` 直接生硬地 memcpy 到 render buffer。
+- 为 `audio_output` 增加了 3 个单元测试，覆盖多声道复制、尾部补零和 `48 kHz -> 44.1 kHz` 的最小重采样行为。
+- 同时在 `crates/app/src/gui.rs` 的中央区域增加了 `Recording Test` tab。这个 tab 专门用于录制 / 监听排障，提供：
+  - 快速切换到 `node-a-wasapi-wav`、`node-a.toml`、`node-a-mock-render.toml` 的按钮
+  - 当前 `wav_path` / `dump_dir` / 设备 / 地址的集中展示
+  - 对“WAV 干净但实时监听有噪声”这种场景的明确诊断提示
+
+验证：
+
+- `cargo check -p audio_output`
+- `cargo test -p audio_output`
+- `cargo test -p app`
+- `cargo build --workspace --release`
+
+关键结果：
+
+- 现在从代码和日志上都已经明确：之前的 `0x80070057` 不是用户配置错了，而是 render 端格式协商过于理想化。
+- 新实现已经通过编译和测试，后续你在本机再试时，`virtual_stub` 场景不应继续被同一条 render 初始化错误挡住。
+
+仍未完成：
+
+- 我这里没有做人工耳机 / 扬声器监听复测，所以“代码路径已改正”不等于“主观听感已经完全验收”。
+- 当前重采样仍是轻量级线性实现，优先目的是兼容设备 mix format 和消除明显噪声，不是高保真播放器级重采样。
+
+### 2026-03-08（分析 `artifacts/windows-wasapi` 录音并修正采集格式协商）
+
+- 直接检查了 `artifacts/windows-wasapi/` 下的 `local_raw.wav`、`output.wav`、`peer_raw.wav`、`peer_aligned.wav` 和 `metrics.tsv`。结论很明确：
+  - `local_raw.wav` 与 `output.wav` 的能量和峰值几乎一致，说明异常不是后处理新增的，而是在 `local_raw` 阶段就已经存在。
+  - `peer_raw` / `peer_aligned` 能量很低，`estimated_crosstalk_rms` 也几乎为 0，因此这批录音里的问题不在 sync/cancel/residual。
+  - `local_raw.wav` 中能看到一段连续贴边到 `-1.0` 的平顶样本，属于真实削顶而不是随机毛刺；同时现有 `clip_events` 统计因为只算 `> 1.0`，把这些刚好打满的削顶漏掉了。
+- 基于这次录音分析，把 `crates/audio_capture/src/lib.rs` 的 WASAPI 采集实现从“强行请求固定 `48 kHz / mono / float32` 共享模式格式”改成了“先读取设备实际 mix format，再自行转换到内部固定格式”：
+  - 当前支持常见 `float32`、`PCM16`、`PCM24`、`PCM32` 采集格式解码
+  - 对多声道输入做 downmix 到 mono
+  - 当设备采样率不是 `48 kHz` 时，使用轻量线性重采样到内部固定采样率
+- 同时把 `crates/app/src/runtime.rs` 里的 `clip_events` 判定改成 `>= 0.999`，让这类刚好削到满幅的异常能在实时指标里被看到，而不是继续显示 0。
+- 为 `audio_capture` 新增了 2 个单元测试，覆盖 `PCM16` 立体声下的 mono downmix，以及 `float32` 单声道数据的原样解码。
+
+验证：
+
+- `cargo check -p audio_capture`
+- `cargo test -p audio_capture`
+- `cargo test -p app`
+- `cargo build --workspace --release`
+
+关键结果：
+
+- 现在从录音文件和代码链路两边都已经明确：先前 `windows-wasapi` 录到的“电流音 / 失真”并不是后处理造成的，而是 WASAPI 采集端固定格式协商过于理想化带来的原始流失真风险。
+- 新实现已改为“采集端、输出端都先跟设备实际格式协商，再转换到内部固定格式”，与此前修过的 render mix format 逻辑保持一致。
+
+仍未完成：
+
+- 我这里没有重新人工录一段你同样说话内容的对照样本，因此还需要你在本机用新版本再录一次，确认 `local_raw.wav` 不再出现同样的平顶削波形态。
+
+### 2026-03-08（运行中设备切换即时生效与更强输入整形）
+
+- 根据最新 operator 反馈，继续收紧了 `crates/app/src/gui.rs` 的设备切换行为。现在 `Audio Input Device` / `Output Target Device` 下拉框或设备列表一旦改值，GUI 会立即把新设备写回当前配置，并在 runtime 正在运行时自动请求 reload；不再要求用户额外点一次 `Save Runtime Fields` 才能让监听设备切换生效。
+- 同时把 `crates/app/src/runtime.rs` 里的 `CaptureConditioner` 再加强了一档：进一步降低输入预衰减目标、收紧软限幅阈值，优先压低仍残留的一点过载感。
+- 结合最新 `artifacts/node-a/local_raw.wav` 的分析，这轮变更的定位已经从“修复明显削顶”转为“继续降低残余过载感，并让用户能更快切换到非同设备监听路径做对比”。
+
+验证：
+
+- `cargo test -p app`
+- `cargo check --workspace`
+
+关键结果：
+
+- 运行中切换监听设备现在已经是即时保存 + reload 路径，行为更接近系统级“换设备即生效”的预期。
+- 现有 `app` 测试全部继续通过，说明新的即时切换逻辑没有破坏原有恢复/重载路径。
+
+仍未完成：
+
+- 目前的“即时生效”本质上仍然是 GUI worker 级 runtime 重建，不是底层 WASAPI stream 的原地无缝切换，因此切换瞬间会有一次短暂重建窗口。
+
+### 2026-03-08（根据最新样本再压 3 档，并只补偿实时输出增益）
+
+- 根据最新 `artifacts/node-a/local_raw.wav` 的量化结果，这批样本已经没有爆音：峰值约 `0.7527`、`clip_ratio = 0`、`metrics.tsv` 里的 `max_clip = 0`。这说明之前的削顶问题已经收住，但按最新主观反馈，还需要继续把听感再压稳一点。
+- 因此把 `crates/app/src/runtime.rs` 中的 `CaptureConditioner` 又往下压了 3 档左右：进一步降低 `INPUT_PAD`、下调 `TARGET_PEAK`，并把软限幅拐点再提前，让本地输入链更保守。
+- 同时在 `crates/audio_output/src/lib.rs` 中增加了“仅对实时输出 sink 生效”的补偿增益和输出软限幅。这样不会再抬高麦克风原始链路，也不会把录下来的 WAV 再次推热，但耳机实时监听不会因为前级压得更狠而一下子变得过小。
+
+验证：
+
+- `cargo test -p audio_output`
+- `cargo test -p app`
+- `cargo check --workspace`
+- `cargo build --workspace --release`
+
+关键结果：
+
+- 当前策略已经明确分成两层：前级更保守地压住输入过载，后级只对实时输出做补偿增益。
+- 这样能继续降低爆音风险，同时不把“整体放大”重新施加到麦克风录音链本身。
+
+仍未完成：
+
+- 这轮调整后的主观听感还需要你在本机再录一段最新样本确认；从代码和测试上看，已经是比上一轮更保守的配置。
+
+### 2026-03-08（新增 `capture_raw.wav` 以区分采样方法与前级整形）
+
+- 在 `crates/app/src/runtime.rs` 的调试导出链中新增了 `capture_raw.wav`。它记录的是 `CaptureSource` 刚读出来的原始帧，还没有经过 `CaptureConditioner`、VAD、消除或残差抑制。
+- 现有的 `local_raw.wav` 仍然保留，但它现在明确表示“已经过本地前级整形后的近端输入”。
+- 这样后续就能把 `artifacts/node-a/capture_raw.wav` 与 `artifacts/node-a/obssample.wav` 直接做 A/B，对应回答“是不是采样方法本身有问题”，而不是再把 OBS 样本和已经过我们前级整形的 `local_raw.wav` 混在一起比。
+
+验证：
+
+- `cargo test -p app`
+- `cargo check --workspace`
+- `cargo build --workspace --release`
+
+关键结果：
+
+- 下一轮录音开始后，仓库里的调试证据会更完整：`capture_raw.wav` 看采样原始链，`local_raw.wav` 看前级整形后结果，`output.wav` 看最终输出。
+
+### 2026-03-08（参考 OBS 思路，移除采集端过早硬裁剪）
+
+- 对照最新的 `artifacts/node-a/capture_raw.wav` 和用户提供的 `artifacts/node-a/obssample.wav` 继续排查后，发现一个更关键的实现差异：我们在 `crates/audio_capture/src/lib.rs` 里过早把采集样本硬裁到 `[-1, 1]`，这会把设备原本仍可恢复的浮点过载直接削成平顶。
+- 这和 OBS 官方 `win-wasapi` 路径的总体思路不一致。OBS 是先按设备 `GetMixFormat()` 的原生格式建流，并把样本继续往后传，不会在采集解码这一层先做这种硬裁。
+- 因此这轮在 `audio_capture` 中移除了两处过早的硬裁：
+  - `decode_capture_packet_to_mono()` 不再在 downmix 之后立刻 `clamp(-1.0, 1.0)`
+  - `push_capture_samples()` 在直通与重采样两条路径里也不再先做 `clamp(-1.0, 1.0)`
+- 这样设备若输出的是浮点过载样本，后面的 `CaptureConditioner` 仍有机会用线性衰减把它拉回安全范围，而不是在采集层直接把波形削成平顶。
+
+验证：
+
+- `cargo test -p audio_capture`
+- `cargo test -p app`
+- `cargo check --workspace`
+- `cargo build --workspace --release`
+
+关键结果：
+
+- 采集链现在更接近 OBS 的处理顺序：先保留原始幅度，再由后级决定如何衰减，而不是在采集层先硬剪波形。
+
+### 2026-03-08（切换到更接近 OBS 的直通监听路径，并将仓库许可证切到 GPL）
+
+- 根据用户最新反馈，当前排障目标不再是“录音文件有没有削顶”，而是“为什么 OBS 监听干净，而我们的实时监听仍有明显电流音”。在这种前提下，继续用自定义动态整形去硬改输入波形已经没有效率，因此这轮把监听路径进一步改成更接近 OBS 的思路：
+  - `crates/app/src/runtime.rs` 的 `CaptureConditioner` 不再做持续性的动态压缩/软削，默认仅保留极端过载时的紧急线性保护
+  - `crates/audio_output/src/lib.rs` 的实时监听增益也降回接近直通，只保留最终写设备前的简单裁剪保护
+- 同时根据用户的明确要求，把工作区 `Cargo.toml` 的许可证元数据从 `MIT OR Apache-2.0` 切换成了 `GPL-2.0-or-later`，并把 OBS 仓库中的 `COPYING` 文件加入本仓库。
+- `README.md` 已同步写明当前仓库许可证为 `GPL-2.0-or-later`。
+
+验证：
+
+- `cargo test -p audio_output`
+- `cargo test -p app`
+- `cargo check --workspace`
+- `cargo build --workspace --release`
+
+关键结果：
+
+- 当前实时监听链已经比之前更少自定义染色，更接近 OBS “设备原始采样 -> 最小保护 -> 输出”的风格。
+- 许可证元数据已经切到 GPL，后续若继续直接参考/移植 OBS 的更多实现，仓库层面不会再卡在旧的 MIT/Apache 声明上。
+
+### 2026-03-08（将实时监听从 DSP 输出改为直接监控 `capture_raw`）
+
+- 按最新要求继续大刀阔斧收紧：`crates/app/src/runtime.rs` 中 `virtual_stub` 场景的实时监听已不再输出 DSP 链末端的 `output_frame`，而是直接输出 `capture_raw`。
+- 也就是说，当前实时监听链已经从“采集 -> sync/vad/cancel/residual -> render”改成了更接近 OBS source monitoring 的“采集 -> render”，而 DSP 主链仍然继续运行并写调试产物。
+- 这次改动的目的很明确：如果用户当前主要关心的是“监听是否还有电流音”，就先把监听路径和处理路径彻底解耦，不再让监听效果被 DSP 中间环节拖累。
+
+验证：
+
+- `cargo test -p app`
+- `cargo check --workspace`
+- `cargo build --workspace --release`
+
+关键结果：
+
+- `virtual_stub` 的实时监听现在已经更接近 OBS 的原始 source monitoring 语义，而不是“处理后再监听”。
+
+### 2026-03-08（恢复处理后监听，并加入反向波前馈抵消）
+
+- 根据最新双机反馈，当前主要问题已经从“单机监听链本身有电流音”转成了“双机互连后希望直接听到处理结果，并开始做更明确的反向波抵消”。因此这轮把 `crates/app/src/runtime.rs` 中 `virtual_stub` 的默认监听源切回处理后的 `output_frame`。同时新增了 `output.monitor_processed_output` 配置，默认 `true`；如需继续排查原始监听链，仍可手动切回 `capture_raw`。
+- 在 `crates/audio_cancel/src/lib.rs` 中给现有 NLMS 增加了前馈式反向波抵消层。当前会先从 `local_raw` / `peer_aligned` 估计一个平滑的直接抵消增益，再把这条前馈预测与原有 NLMS 预测叠加，输出总预测信号后做误差更新。
+- 在 `crates/audio_residual/src/lib.rs` 中把原来非常轻的残余衰减升级成动态残余抑制：当本地未说话而对端活跃时，会结合 `peer_vad`、`coherence` 和 `estimated_crosstalk_rms` 对低电平残余和底噪做更强的噪声门 / 扩展处理。
+- `crates/common_types/src/lib.rs` 现在新增了 `cancel.anti_phase_enabled`、`cancel.anti_phase_max_gain`、`cancel.anti_phase_smoothing` 和 `output.monitor_processed_output` 配置字段；`crates/app/src/config.rs` 也补了对应的配置校验。
+
+验证：
+
+- `cargo test -p audio_cancel`
+- `cargo test -p audio_residual`
+- `cargo test -p app`
+- `cargo check --workspace`
+
+关键结果：
+
+- 现在双机实时监听默认会直接播放处理后输出，而不是继续听原始采集。
+- 串音消除链已经不再只有 NLMS 和轻残余衰减，还多了一层明确的前馈反向波抵消与更强的动态残余抑制。
+
+仍未完成：
+
+- 当前反向波抵消仍是“单帧标量增益 + NLMS”混合模型，不是频域多带或更长 FIR 的完整产品级实现。
+- GUI 还没有单独暴露 `monitor_processed_output` 和新的 anti-phase 参数；当前主要通过 TOML 默认值生效。
+
+### 2026-03-08（继续加强处理后监听链的串音压制）
+
+- 根据最新反馈“处理后监听里仍能听到对端传过来的声音”，继续加强了 `crates/app/src/runtime.rs`、`crates/audio_cancel/src/lib.rs` 和 `crates/audio_residual/src/lib.rs` 的压制链，而不是停留在第一版前馈反向波上。
+- `runtime` 里的 NLMS 更新窗口不再简单要求 `peer_vad && !local_vad`。现在改成“只要对端活跃、coherence 足够高、且当前帧不是明显的 near-end dominant，就允许自适应更新”，避免远端泄漏本身把 `local_vad` 撑高后把更新一直冻死。
+- `audio_residual` 现在新增了第二次反向波残余抵消：会对 `canceled` 与 `peer_aligned` 再估一个平滑的残余相关增益，先做一轮 residual anti-phase subtraction，再进入动态噪声门/扩展器。
+- 这次的目的很明确：不只是“把底噪门下去”，而是继续压低仍然和对端参考高度相关的残余串音，尽量减少“另一边的声音还听得到”的情况。
+
+验证：
+
+- `cargo test -p audio_residual`
+- `cargo test -p app`
+- `cargo run -q -p offline_replay -- configs/node-a-mock.toml 180`
+
+关键结果：
+
+- 离线 mock 回放继续通过，`offline_replay` 本轮输出 `output_rms=0.00092`、`coherence=0.999`，说明加强后的残余链没有把 mock 场景跑坏。
+- 新增的 residual 单元测试已经覆盖了三件事：本地说话不被明显削弱、静音时低电平残余会被更狠地压下去、以及第二次反向波抵消确实能进一步压低与对端参考相关的残余。
+
+仍未完成：
+
+- 这一轮仍然是单通道、时域、标量增益为主的增强，不是频域多带自适应或更长时窗的完整产品级 AEC。
+- 还需要你在真实双机上继续听处理后监听；如果仍有明显串音残留，下一步就该把参考路径做成多段延迟 / 多带后滤波，而不是只继续调单一门限。
+
+### 2026-03-08（更激进的默认消除参数与 GUI 降噪滑块）
+
+- 根据最新“处理后监听里仍能明显听到对端声音”的反馈，继续把默认参数整体推得更激进：`CancelConfig::default()` 现在改成更高的 `step_size`、更低的 `update_threshold`、更深的 `anti_phase_max_gain` 和更快的 `anti_phase_smoothing`；`ResidualConfig::default()` 的 `strength` 也从原来的轻量值抬到了明显更强的默认档位。
+- 对应的样例配置 `configs/node-a.toml`、`configs/node-b.toml`、`configs/node-a-mock.toml`、`configs/node-a-mock-render.toml`、`configs/node-a-wasapi-wav.toml` 也已显式写入这组更强的新默认值，保证 GUI/内置 preset/release exe 一致。
+- 在 `crates/app/src/gui.rs` 左侧控制面板新增了 `Noise Reduction` 控制区，当前可直接调：
+  - `Monitor processed output`
+  - `Adaptation speed`
+  - `Update threshold`
+  - `Anti-phase depth`
+  - `Anti-phase smoothing`
+  - `Residual strength`
+  - 以及启用/关闭 `anti-phase` 和 `residual suppressor`
+- 这些控件会写回当前 TOML，并通过 `Apply Noise Controls` 或现有 `Save Runtime Fields` 生效；如果 runtime 正在运行，保存后会自动请求 reload。
+
+验证：
+
+- `cargo test -p app`
+- `cargo check --workspace`
+- `cargo run -q -p offline_replay -- configs/node-a-mock.toml 180`
+
+关键结果：
+
+- 本轮 `offline_replay` 的输出已经继续收紧到 `output_rms=0.00004`、`coherence=0.999`，比上一轮更低，说明更激进的默认参数在 mock 串音场景里确实进一步压低了残余输出。
+- GUI 相关测试确认新参数字段会跟随配置一起 reload / save，不会只停留在界面状态里。
+
+仍未完成：
+
+- 还没有把这些降噪滑块做成运行中无缝热调；当前仍然依赖一次配置保存 + runtime reload。
+- 真实双机监听里如果仍有明显串音，下一步就该进入多带后滤波 / 更细粒度参考延迟建模，而不是再无限往上拧单个标量参数。
+
+### 2026-03-08（为降噪滑块补充通俗说明）
+
+- 在 `crates/app/src/gui.rs` 的 `Noise Reduction` 控制区里，为每个开关和滑块都补了更直白的说明文案。
+- 当前文案会直接告诉 operator “向左 / 向右会发生什么”，例如：
+  - `Adaptation speed` 向右会更快学习对端泄漏，但过右可能让自己声音变薄
+  - `Update threshold` 向左通常会更强地消除对端声音
+  - `Anti-phase depth` 向右会更强抵消对端参考，但过右可能出现空洞感
+  - `Residual strength` 向右会更狠地压最后的残留和底噪，但过右会发闷
+- 这样后续调试时不再需要对照代码猜每个参数的方向和副作用。
+- 同时新增了 GUI 交互测试，不再只验证“字段存在”或“配置能保存”。当前测试会实际渲染 `Noise Reduction` 区，模拟点击复选框和拖动滑块，并断言 `monitor_processed_output`、`update_threshold`、`anti_phase_depth`、`residual_strength` 等值确实通过 GUI 发生变化。
+
+验证：
+
+- `cargo test -p app`
+- `cargo build --workspace --release`

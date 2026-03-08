@@ -26,7 +26,8 @@
 - 仓库仍然不会自己创建新的系统级 capture endpoint，所以“完全内建的虚拟麦设备”仍未完成
 - 当前推荐的输出桥接验证配置是 `configs/node-a-mock-render.toml`
 - GUI worker 现在会在配置加载失败、runtime 初始化失败或运行中音频 I/O 失败后进入 `Recovering: ...` 状态，并定期重试
-- 运行中的 GUI 现在支持 `Reload Runtime`；如果先点选设备再点 `Save Device Fields`，会在保存 TOML 后自动请求 reload，无需关闭应用
+- 运行中的 GUI 现在支持 `Reload Runtime`；如果先修改设备、网络字段或 `Noise Reduction` 区的降噪参数再点 `Save Runtime Fields` / `Apply Noise Controls`，会在保存 TOML 后自动请求 reload，无需关闭应用
+- GUI 现在也支持直接编辑 `listen_addr` / `peer_addr`；双机局域网场景不必再手改 TOML
 - 未修改的 `configs/node-a.toml` / `configs/node-b.toml` 仍包含占位输入设备名；如果本机不存在该名字，启动时报“找不到配置的 capture device”属于正常现象，不应误记成回归
 
 ## Environment Checklist
@@ -160,21 +161,38 @@ cargo run -p app --release
 期望：
 
 - GUI 窗口可以打开
+- 顶部应为菜单栏，而不只是静态标题；其中至少应有 `Language` / `语言` 菜单，且当前默认应显示中文界面
+- 菜单中应可切换 `English` 和 `中文`
 - 可编辑配置路径
+- 即使仓库外部没有单独的 `configs/` 目录，`Load Config` 下拉中也应能看到内置预设
 - 左侧应能显示 `Capture Devices` / `Render Devices` 列表，并标记默认设备
 - 中文设备名和中文文案不应再显示为方块/乱码
-- 左侧应能显示 `Audio Input Device` / `Output Target Device` 可编辑字段
+- 左侧的 `Audio Input Device` / `Output Target Device` 应为下拉菜单，而不是纯文本输入框
+- 左侧应能显示 `Local Listen Address` / `Peer Address` 可编辑字段
 - `Load Config` 应为下拉菜单，并列出 `configs/` 下已发现的 TOML 预设
-- 应可通过 `Load Config` 或 `Load Current Path` 读出当前配置中的设备字段，并通过 `Save Device Fields` 写回 TOML
+- 应可通过 `Import Config Folder` 打开 Windows 文件夹选择界面；只选择一个 config 文件夹，就应能把其中的 `.toml` 批量导入到当前预设列表
+- 完全相同内容的配置文件不应被重复导入
+- 若出现同名但内容不同的配置，GUI 应先弹出警告；确认后自动重命名为 `name-1.toml`、`name-2.toml` 这样的形式，而不是 `name-1-1.toml`
+- 应可通过 `Load Config` 读出当前配置中的设备字段和网络字段，并通过 `Save Runtime Fields` 写回 TOML
+- `Noise Reduction` 区应能看到处理后监听、反向波和残余抑制相关的滑块 / 开关；调整后点击 `Apply Noise Controls` 应把参数写回当前 TOML
 - 点击 `Load Config` 后，状态栏和配置反馈应明确显示已从哪个路径装入配置
-- 即使未先点 `Save Device Fields`，点击 `Start` 也应先把当前界面中的设备字段同步进配置，再启动 runtime
+- 即使未先点 `Save Runtime Fields`，点击 `Start` 也应先把当前界面中的设备字段和网络字段同步进配置，再启动 runtime
+- 若当前目录没有对应的 `configs/*.toml`，首次 `Save Runtime Fields` 后应自动创建 `configs/` 并把配置写出
 - 左侧控制面板和 `Realtime Metrics` 面板都应支持鼠标滚轮滚动
 - 当加载的是 `audio=mock` 或 `output=wav_dump/null` 的配置时，GUI 应明确提示哪些设备字段在该模式下会被忽略
+- 当加载的是 `transport=mock` 的配置时，GUI 应明确提示 `listen_addr` / `peer_addr` 会被忽略
 - runtime 运行中应可看到 `Reload Runtime` 按钮
+- 中央区域应能切换 `Metrics` / `Recording Test` 两个 tab
 - `Realtime Metrics` 不应再只是纯文本表格；应能看到状态卡、历史折线图和关键指标进度条
+- `Realtime Metrics` 标题旁应能看到 `Metrics Size` 按钮组；默认 `Small` 模式下一行应显示 4 个指标面板
 - 指标面板与开始/停止按钮可见
 - GUI 启动后，仓库根目录 `logs/` 下应出现新的 `app-<pid>-<timestamp>.log`
 - GUI 中出现的关键状态变化，例如 `Config load failed`、`Recovering: ...`、`Reload requested`，也应同步写入最新日志文件
+
+如果使用 `output = virtual_stub` 做实时监听：
+
+- 若日志里出现 `failed to initialize WASAPI render ... 参数错误 (0x80070057)`，说明设备不接受旧的自定义 render 格式；当前实现应改为按设备实际 mix format 建流，不应再长期停留在这类错误上
+- 可先切到 `Recording Test` tab，加载 `Capture-To-WAV` 预设验证“录 WAV 是否正常”；若 WAV 干净但实时监听仍异常，问题应优先归因到监听 / 输出链路，而不是采集主链
 
 ### 7. GUI Mock Runtime Test
 
@@ -249,16 +267,37 @@ cargo run -p app --release
 
 1. 先用一个可运行的配置启动 GUI
 2. 在左侧设备列表中点击新的 capture 或 render 设备
-3. 点击 `Save Device Fields`
+3. 点击 `Save Runtime Fields`
 4. 观察状态短暂进入 `Recovering: reloading runtime ...`，随后恢复到 `Running: frame ...`
 
 期望：
 
 - 不需要关闭整个 GUI 进程
-- `Save Device Fields` 在 runtime 运行中应自动触发 reload
+- `Save Runtime Fields` 在 runtime 运行中应自动触发 reload
 - 若设备暂时不可用，worker 应持续停留在 `Recovering: ...` 并重试，而不是只报一次错后退出
 
-### 10. Default Config Placeholder Validation
+### 10. GUI Dual-Node IP Configuration Test
+
+使用两台 Windows 机器，各自运行 GUI。
+
+步骤：
+
+1. A 侧加载 `configs/node-a.toml`，B 侧加载 `configs/node-b.toml`
+2. 两边都把 `Local Listen Address` 设成 `0.0.0.0:38001`
+3. A 侧把 `Peer Address` 改成 `B机器IP:38001`
+4. B 侧把 `Peer Address` 改成 `A机器IP:38001`
+5. 两边根据本机实际设备修改 `Audio Input Device` / `Output Target Device`
+6. 点击 `Save Runtime Fields`
+7. 再点击 `Start`
+
+期望：
+
+- 不需要手工编辑 TOML，也能完成双机 IP 互连配置
+- GUI 保存后重新 `Load Config`，应能看到最新地址被持久化
+- 如果只在 `Peer Address` 输入纯 IP，例如 `192.168.1.22`，保存后应自动补成原端口，例如 `192.168.1.22:38001`
+- 两边启动后 `Transport Loss` 应明显低于单机无 peer 时的接近 `100%`
+
+### 11. Default Config Placeholder Validation
 
 如果需要确认默认双机配置仍然需要人工填写真实设备名，可用未改动的 `configs/node-a.toml` 做一次显式验证：
 

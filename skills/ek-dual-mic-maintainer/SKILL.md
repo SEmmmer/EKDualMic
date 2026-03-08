@@ -45,6 +45,10 @@ Do not leave project state only in commit diffs or chat history. Write it into t
 - For Windows GUI or operator flow changes, use `configs/node-a-mock.toml` plus the procedure in `docs/windows-test.md`.
 - Remember that `configs/node-a-mock.toml` is intentionally synthetic. It should not be used to validate live microphone behavior.
 - Use `configs/node-a-wasapi-wav.toml` for real microphone capture without a live output endpoint. In single-node validation without a peer, it should keep running and rely on concealment rather than dropping into `Recovering` due to UDP receive errors.
+- For real dual-node LAN work, remember the GUI now exposes `Local Listen Address` and `Peer Address`; the recommended pattern is `0.0.0.0:38001` locally on both machines and the opposite machine's `IP:38001` as `peer_addr`.
+- The GUI top bar now includes a language menu for `English` / `中文`; if screenshots or user reports look inconsistent, first confirm which UI language is currently selected.
+- Default config presets are now embedded into `app.exe`; when the repo `configs/` directory is absent, GUI preset loading should still work and first save should materialize a local `configs/` directory beside the executable or workspace root.
+- The GUI can now import an entire config folder through a native Windows folder picker. Exact-content duplicates should be skipped; same-name different-content files should trigger a warning and, on confirmation, be renamed with incrementing suffixes like `-1`, `-2` rather than `-1-1`.
 
 ## Handoff Expectations
 
