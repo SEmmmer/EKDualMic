@@ -3,4 +3,5 @@ artifacts/
 *.wav
 *.tsv
 logs/
+%TEMP%/
 

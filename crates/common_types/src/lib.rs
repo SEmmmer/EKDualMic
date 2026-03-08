@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -6,6 +7,7 @@ pub const SAMPLE_RATE_HZ: u32 = 48_000;
 pub const CHANNELS: usize = 1;
 pub const FRAME_MS: usize = 10;
 pub const SAMPLES_PER_FRAME: usize = (SAMPLE_RATE_HZ as usize * FRAME_MS) / 1_000;
+pub const TRANSPORT_LOSS_RATE_WINDOW_FRAMES: usize = 2_400;
 
 pub type Sample = f32;
 
@@ -141,15 +143,89 @@ pub struct TransportStats {
     pub received_packets: u64,
     pub concealed_packets: u64,
     pub dropped_packets: u64,
+    pub window_received_packets: u32,
+    pub window_concealed_packets: u32,
 }
 
 impl TransportStats {
     pub fn loss_rate(&self) -> f32 {
-        let delivered = self.received_packets + self.concealed_packets;
+        let delivered = if self.window_received_packets + self.window_concealed_packets > 0 {
+            (self.window_received_packets + self.window_concealed_packets) as u64
+        } else {
+            self.received_packets + self.concealed_packets
+        };
+        let concealed = if self.window_received_packets + self.window_concealed_packets > 0 {
+            self.window_concealed_packets as u64
+        } else {
+            self.concealed_packets
+        };
         if delivered == 0 {
             0.0
         } else {
-            self.concealed_packets as f32 / delivered as f32
+            concealed as f32 / delivered as f32
+        }
+    }
+
+    pub fn with_loss_window(mut self, window: &TransportLossWindow) -> Self {
+        let (received, concealed) = window.packet_counts();
+        self.window_received_packets = received;
+        self.window_concealed_packets = concealed;
+        self
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TransportLossWindow {
+    recent: VecDeque<bool>,
+    concealed_count: usize,
+    capacity: usize,
+}
+
+impl Default for TransportLossWindow {
+    fn default() -> Self {
+        Self::new(TRANSPORT_LOSS_RATE_WINDOW_FRAMES)
+    }
+}
+
+impl TransportLossWindow {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            recent: VecDeque::with_capacity(capacity),
+            concealed_count: 0,
+            capacity,
+        }
+    }
+
+    pub fn record_received(&mut self) {
+        self.push(false);
+    }
+
+    pub fn record_concealed(&mut self) {
+        self.push(true);
+    }
+
+    pub fn packet_counts(&self) -> (u32, u32) {
+        (
+            self.recent.len().saturating_sub(self.concealed_count) as u32,
+            self.concealed_count as u32,
+        )
+    }
+
+    fn push(&mut self, concealed: bool) {
+        if self.capacity == 0 {
+            return;
+        }
+
+        if self.recent.len() == self.capacity
+            && let Some(previous) = self.recent.pop_front()
+            && previous
+        {
+            self.concealed_count = self.concealed_count.saturating_sub(1);
+        }
+
+        self.recent.push_back(concealed);
+        if concealed {
+            self.concealed_count += 1;
         }
     }
 }
@@ -192,6 +268,24 @@ pub enum TransportBackend {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
+pub enum SessionMode {
+    MasterSlave,
+    #[default]
+    Peer,
+    Both,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeRole {
+    Master,
+    Slave,
+    #[default]
+    Peer,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
 pub enum AudioBackend {
     #[default]
     Wasapi,
@@ -205,6 +299,54 @@ pub enum OutputBackend {
     VirtualStub,
     WavDump,
     Null,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputRoutingMode {
+    #[default]
+    LocalOnly,
+    Off,
+    MixToPrimary,
+    SplitLocalPeer,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NodeIdentity {
+    pub role: NodeRole,
+    pub session_mode: SessionMode,
+}
+
+impl NodeIdentity {
+    pub fn expected_peer(self) -> Self {
+        match self.session_mode {
+            SessionMode::MasterSlave => Self {
+                role: match self.role {
+                    NodeRole::Master => NodeRole::Slave,
+                    NodeRole::Slave => NodeRole::Master,
+                    NodeRole::Peer => NodeRole::Peer,
+                },
+                session_mode: SessionMode::MasterSlave,
+            },
+            SessionMode::Peer => Self {
+                role: NodeRole::Peer,
+                session_mode: SessionMode::Peer,
+            },
+            SessionMode::Both => Self {
+                role: NodeRole::Peer,
+                session_mode: SessionMode::Both,
+            },
+        }
+    }
+}
+
+impl NodeConfig {
+    pub fn identity(&self) -> NodeIdentity {
+        NodeIdentity {
+            role: self.node.role,
+            session_mode: self.node.session_mode,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -241,6 +383,8 @@ impl Default for NodeConfig {
 #[serde(default)]
 pub struct NodeSection {
     pub name: String,
+    pub session_mode: SessionMode,
+    pub role: NodeRole,
     pub listen_addr: String,
     pub peer_addr: String,
     pub transport_backend: TransportBackend,
@@ -249,7 +393,9 @@ pub struct NodeSection {
 impl Default for NodeSection {
     fn default() -> Self {
         Self {
-            name: "node-a".to_owned(),
+            name: "peer".to_owned(),
+            session_mode: SessionMode::Peer,
+            role: NodeRole::Peer,
             listen_addr: "0.0.0.0:38001".to_owned(),
             peer_addr: "127.0.0.1:38002".to_owned(),
             transport_backend: TransportBackend::Udp,
@@ -283,7 +429,10 @@ impl Default for AudioConfig {
 #[serde(default)]
 pub struct OutputConfig {
     pub backend: OutputBackend,
-    pub target_device: String,
+    #[serde(alias = "target_device")]
+    pub primary_target_device: String,
+    pub secondary_target_device: String,
+    pub routing: OutputRoutingMode,
     pub monitor_processed_output: bool,
     pub wav_path: PathBuf,
 }
@@ -292,7 +441,9 @@ impl Default for OutputConfig {
     fn default() -> Self {
         Self {
             backend: OutputBackend::VirtualStub,
-            target_device: "Processed Mic".to_owned(),
+            primary_target_device: "default".to_owned(),
+            secondary_target_device: "default".to_owned(),
+            routing: OutputRoutingMode::LocalOnly,
             monitor_processed_output: true,
             wav_path: PathBuf::from("artifacts/output.wav"),
         }

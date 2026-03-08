@@ -7,8 +7,9 @@ use audio_sync::SyncAligner;
 use audio_transport::{TransportLink, build_transport};
 use audio_vad::VoiceActivityDetector;
 use common_types::{
-    AudioBackend, AudioFrame, NodeConfig, OutputBackend, RuntimeSnapshot, SAMPLES_PER_FRAME,
-    TransportBackend, TransportStats, VadDecision, now_micros,
+    AudioBackend, AudioFrame, NodeConfig, OutputBackend, OutputRoutingMode, RuntimeSnapshot,
+    SAMPLES_PER_FRAME, SessionMode, TransportBackend, TransportLossWindow, TransportStats,
+    VadDecision, now_micros,
 };
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -32,9 +33,11 @@ pub struct PipelineRuntime {
     sync: SyncAligner,
     vad_local: VoiceActivityDetector,
     vad_peer: VoiceActivityDetector,
-    cancel: NlmsCanceller,
-    residual: ResidualSuppressor,
-    output: Box<dyn OutputSink>,
+    cancel_local: NlmsCanceller,
+    cancel_peer: NlmsCanceller,
+    residual_local: ResidualSuppressor,
+    residual_peer: ResidualSuppressor,
+    output: OutputRouter,
     debug: DebugRecorder,
     last_snapshot: RuntimeSnapshot,
 }
@@ -54,9 +57,11 @@ impl PipelineRuntime {
             config.vad.peer_threshold,
             config.vad.smoothing,
         );
-        let cancel = NlmsCanceller::new(&config.cancel);
-        let residual = ResidualSuppressor::new(&config.residual);
-        let output = build_output_sink(&config.output)?;
+        let cancel_local = NlmsCanceller::new(&config.cancel);
+        let cancel_peer = NlmsCanceller::new(&config.cancel);
+        let residual_local = ResidualSuppressor::new(&config.residual);
+        let residual_peer = ResidualSuppressor::new(&config.residual);
+        let output = OutputRouter::new(&config.output)?;
         let debug = DebugRecorder::new(&config)?;
 
         info!(
@@ -74,8 +79,10 @@ impl PipelineRuntime {
             sync,
             vad_local,
             vad_peer,
-            cancel,
-            residual,
+            cancel_local,
+            cancel_peer,
+            residual_local,
+            residual_peer,
             output,
             debug,
             last_snapshot: RuntimeSnapshot::default(),
@@ -105,28 +112,45 @@ impl PipelineRuntime {
         let allow_update = peer_vad.is_speech
             && !near_end_dominant(&local_raw, &peer_aligned, local_vad, peer_vad)
             && sync_report.coherence >= self.config.cancel.update_threshold * 0.85;
-        self.cancel.set_update_frozen(!allow_update);
+        self.cancel_local.set_update_frozen(!allow_update);
+        let allow_peer_update = local_vad.is_speech
+            && !near_end_dominant(&peer_aligned, &local_raw, peer_vad, local_vad)
+            && sync_report.coherence >= self.config.cancel.update_threshold * 0.85;
+        self.cancel_peer.set_update_frozen(!allow_peer_update);
 
-        let (canceled, cancel_report) = self.cancel.process(&local_raw, &peer_aligned);
-        let output_frame = self.residual.process(
-            &canceled,
+        let (local_canceled, cancel_report) = self.cancel_local.process(&local_raw, &peer_aligned);
+        let local_output_frame = self.residual_local.process(
+            &local_canceled,
             &peer_aligned,
             local_vad,
             peer_vad,
             sync_report.coherence,
             cancel_report.estimated_crosstalk_rms,
         );
-        let monitor_frame = if self.config.output.backend == OutputBackend::VirtualStub
-            && !self.config.output.monitor_processed_output
-        {
-            &capture_raw
-        } else {
-            &output_frame
-        };
-        self.output.write_frame(monitor_frame)?;
+        let (peer_canceled, peer_cancel_report) =
+            self.cancel_peer.process(&peer_aligned, &local_raw);
+        let peer_output_frame = self.residual_peer.process(
+            &peer_canceled,
+            &local_raw,
+            peer_vad,
+            local_vad,
+            sync_report.coherence,
+            peer_cancel_report.estimated_crosstalk_rms,
+        );
+        self.output.write_frames(
+            if self.config.output.backend == OutputBackend::VirtualStub
+                && !self.config.output.monitor_processed_output
+            {
+                &capture_raw
+            } else {
+                &local_output_frame
+            },
+            &peer_output_frame,
+            self.config.node.session_mode,
+        )?;
 
         let transport_stats = self.transport.stats();
-        let clip_events = output_frame
+        let clip_events = local_output_frame
             .samples
             .iter()
             .filter(|sample| sample.abs() >= 0.999)
@@ -146,7 +170,7 @@ impl PipelineRuntime {
             received_packets: transport_stats.received_packets,
             concealed_packets: transport_stats.concealed_packets,
             input_rms: local_raw.rms(),
-            output_rms: output_frame.rms(),
+            output_rms: local_output_frame.rms(),
             estimated_crosstalk_rms: cancel_report.estimated_crosstalk_rms,
             clip_events,
             processing_time_us: started_at.elapsed().as_micros() as u64,
@@ -157,7 +181,7 @@ impl PipelineRuntime {
             &local_raw,
             &peer_raw,
             &peer_aligned,
-            &output_frame,
+            &local_output_frame,
             &snapshot,
         )?;
         self.last_snapshot = snapshot.clone();
@@ -174,6 +198,95 @@ impl PipelineRuntime {
         self.debug.finalize()?;
         Ok(())
     }
+}
+
+struct OutputRouter {
+    routing: OutputRoutingMode,
+    primary: Option<Box<dyn OutputSink>>,
+    secondary: Option<Box<dyn OutputSink>>,
+}
+
+impl OutputRouter {
+    fn new(config: &common_types::OutputConfig) -> Result<Self> {
+        let primary = if matches!(config.routing, OutputRoutingMode::Off) {
+            None
+        } else {
+            Some(build_output_sink(config)?)
+        };
+        let secondary = if matches!(config.routing, OutputRoutingMode::SplitLocalPeer) {
+            let mut secondary_config = config.clone();
+            secondary_config.primary_target_device = config.secondary_target_device.clone();
+            Some(build_output_sink(&secondary_config)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            routing: config.routing,
+            primary,
+            secondary,
+        })
+    }
+
+    fn write_frames(
+        &mut self,
+        local_frame: &AudioFrame,
+        peer_frame: &AudioFrame,
+        session_mode: SessionMode,
+    ) -> Result<()> {
+        match self.routing {
+            OutputRoutingMode::Off => Ok(()),
+            OutputRoutingMode::LocalOnly => {
+                if let Some(primary) = self.primary.as_mut() {
+                    primary.write_frame(local_frame)?;
+                }
+                Ok(())
+            }
+            OutputRoutingMode::MixToPrimary => {
+                if let Some(primary) = self.primary.as_mut() {
+                    let mixed = mix_frames(local_frame, peer_frame);
+                    primary.write_frame(&mixed)?;
+                }
+                Ok(())
+            }
+            OutputRoutingMode::SplitLocalPeer => {
+                if let Some(primary) = self.primary.as_mut() {
+                    primary.write_frame(local_frame)?;
+                }
+                if let Some(secondary) = self.secondary.as_mut() {
+                    secondary.write_frame(peer_frame)?;
+                } else if matches!(session_mode, SessionMode::MasterSlave | SessionMode::Both) {
+                    anyhow::bail!("split_local_peer routing requires a secondary output sink")
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn finalize(&mut self) -> Result<()> {
+        if let Some(primary) = self.primary.as_mut() {
+            primary.finalize()?;
+        }
+        if let Some(secondary) = self.secondary.as_mut() {
+            secondary.finalize()?;
+        }
+        Ok(())
+    }
+}
+
+fn mix_frames(local: &AudioFrame, peer: &AudioFrame) -> AudioFrame {
+    let samples = local
+        .samples
+        .iter()
+        .zip(peer.samples.iter())
+        .map(|(left, right)| ((left + right) * 0.5).clamp(-1.0, 1.0))
+        .collect();
+    AudioFrame::new(
+        local.sequence,
+        local.capture_timestamp_us,
+        local.sample_rate,
+        samples,
+    )
 }
 
 #[derive(Default)]
@@ -252,6 +365,8 @@ fn build_pipeline_io(
         config.sync.jitter_buffer_frames as usize,
         config.audio.frame_ms as usize,
         config.debug.mock_peer_delay_ms,
+        config.identity(),
+        config.identity().expected_peer(),
     )?;
     Ok((capture, transport, false))
 }
@@ -281,6 +396,7 @@ impl CaptureSource for MockSceneCapture {
 
 struct MockSceneTransport {
     scene: SharedMockScene,
+    loss_window: TransportLossWindow,
     stats: TransportStats,
     last_frame: Option<AudioFrame>,
 }
@@ -289,6 +405,7 @@ impl MockSceneTransport {
     fn new(scene: SharedMockScene) -> Self {
         Self {
             scene,
+            loss_window: TransportLossWindow::default(),
             stats: TransportStats::default(),
             last_frame: None,
         }
@@ -304,11 +421,13 @@ impl TransportLink for MockSceneTransport {
     fn recv_or_conceal(&mut self) -> Result<AudioFrame> {
         if let Some(frame) = self.scene.lock().take_peer_frame() {
             self.stats.received_packets += 1;
+            self.loss_window.record_received();
             self.last_frame = Some(frame.clone());
             return Ok(frame);
         }
 
         self.stats.concealed_packets += 1;
+        self.loss_window.record_concealed();
         Ok(self
             .last_frame
             .clone()
@@ -317,7 +436,7 @@ impl TransportLink for MockSceneTransport {
     }
 
     fn stats(&self) -> TransportStats {
-        self.stats
+        self.stats.with_loss_window(&self.loss_window)
     }
 }
 

@@ -1,0 +1,58 @@
+[node]
+name = "peer"
+session_mode = "both"
+role = "peer"
+listen_addr = "0.0.0.0:38001"
+peer_addr = "192.168.1.22:38001"
+transport_backend = "udp"
+
+[audio]
+backend = "wasapi"
+input_device = "Microphone (PRO X 2 LIGHTSPEED)"
+sample_rate = 48000
+channels = 1
+frame_ms = 10
+
+[output]
+backend = "virtual_stub"
+primary_target_device = "3 - P2710V (AMD High Definition Audio Device)"
+secondary_target_device = "扬声器 (PRO X 2 LIGHTSPEED)"
+routing = "split_local_peer"
+monitor_processed_output = true
+wav_path = 'C:\Users\emmmer.SUPERXLB\git\EKDualMic\artifacts/peer/processed-output.wav'
+
+[sync]
+jitter_buffer_frames = 3
+coarse_search_ms = 30
+drift_compensation = true
+
+[cancel]
+filter_length = 1536
+step_size = 0.05999999865889549
+leakage = 0.00009999999747378752
+update_threshold = 0.47999998927116394
+anti_phase_enabled = true
+anti_phase_max_gain = 1.4500000476837158
+anti_phase_smoothing = 0.7200000286102295
+
+[vad]
+enabled = true
+local_threshold = 0.6000000238418579
+peer_threshold = 0.6000000238418579
+smoothing = 0.8500000238418579
+
+[residual]
+enabled = true
+strength = 0.7200000286102295
+
+[debug]
+dump_wav = true
+dump_metrics = true
+dump_dir = 'C:\Users\emmmer.SUPERXLB\git\EKDualMic\artifacts/peer'
+log_level = "info"
+mock_peer_delay_ms = 20
+mock_peer_gain = 0.3499999940395355
+
+[gui]
+auto_start = false
+refresh_hz = 30

@@ -1,5 +1,8 @@
 use anyhow::{Context, Result, bail};
-use common_types::{CHANNELS, FRAME_MS, NodeConfig, SAMPLE_RATE_HZ, TransportBackend};
+use common_types::{
+    CHANNELS, FRAME_MS, NodeConfig, NodeRole, OutputBackend, OutputRoutingMode,
+    SAMPLE_RATE_HZ, SessionMode, TransportBackend,
+};
 use std::collections::BTreeMap;
 use std::fs;
 use std::fs::{File, OpenOptions};
@@ -134,12 +137,79 @@ pub fn validate_config(config: &NodeConfig) -> Result<()> {
         bail!("cancel.filter_length must be > 0");
     }
 
+    validate_pairing_mode(config)?;
+    validate_output_routing(config)?;
+
     if config.cancel.anti_phase_max_gain < 0.0 {
         bail!("cancel.anti_phase_max_gain must be >= 0");
     }
 
     if !(0.0..1.0).contains(&config.cancel.anti_phase_smoothing) {
         bail!("cancel.anti_phase_smoothing must be in [0, 1)");
+    }
+
+    Ok(())
+}
+
+fn validate_pairing_mode(config: &NodeConfig) -> Result<()> {
+    match (config.node.session_mode, config.node.role) {
+        (SessionMode::MasterSlave, NodeRole::Master | NodeRole::Slave) => Ok(()),
+        (SessionMode::Peer, NodeRole::Peer) => Ok(()),
+        (SessionMode::Both, NodeRole::Peer) => Ok(()),
+        (SessionMode::MasterSlave, NodeRole::Peer) => bail!(
+            "master_slave mode only allows role=master or role=slave"
+        ),
+        (SessionMode::Peer | SessionMode::Both, NodeRole::Master | NodeRole::Slave) => bail!(
+            "peer/both mode only allows role=peer"
+        ),
+    }
+}
+
+fn validate_output_routing(config: &NodeConfig) -> Result<()> {
+    match (config.node.session_mode, config.node.role, config.output.routing) {
+        (SessionMode::MasterSlave, NodeRole::Master, OutputRoutingMode::MixToPrimary)
+        | (SessionMode::MasterSlave, NodeRole::Master, OutputRoutingMode::SplitLocalPeer)
+        | (SessionMode::MasterSlave, NodeRole::Slave, OutputRoutingMode::LocalOnly)
+        | (SessionMode::MasterSlave, NodeRole::Slave, OutputRoutingMode::Off)
+        | (SessionMode::Peer, NodeRole::Peer, OutputRoutingMode::LocalOnly)
+        | (SessionMode::Both, NodeRole::Peer, OutputRoutingMode::MixToPrimary)
+        | (SessionMode::Both, NodeRole::Peer, OutputRoutingMode::SplitLocalPeer) => {}
+        (SessionMode::MasterSlave, NodeRole::Master, _) => bail!(
+            "master mode only allows output.routing = mix_to_primary or split_local_peer"
+        ),
+        (SessionMode::MasterSlave, NodeRole::Slave, _) => bail!(
+            "slave mode only allows output.routing = local_only or off"
+        ),
+        (SessionMode::Peer, NodeRole::Peer, _) => {
+            bail!("peer mode only allows output.routing = local_only")
+        }
+        (SessionMode::Both, NodeRole::Peer, _) => bail!(
+            "both mode only allows output.routing = mix_to_primary or split_local_peer"
+        ),
+        _ => {}
+    }
+
+    if config.output.routing == OutputRoutingMode::SplitLocalPeer {
+        if config.output.backend != OutputBackend::VirtualStub {
+            bail!("output.routing = split_local_peer requires output.backend = virtual_stub");
+        }
+        if config
+            .output
+            .primary_target_device
+            .trim()
+            .eq_ignore_ascii_case(config.output.secondary_target_device.trim())
+        {
+            bail!(
+                "split_local_peer requires two distinct output devices; use mix_to_primary for a single device mix"
+            );
+        }
+    }
+
+    if matches!(config.output.routing, OutputRoutingMode::MixToPrimary | OutputRoutingMode::LocalOnly)
+        && config.output.primary_target_device.trim().is_empty()
+        && config.output.backend == OutputBackend::VirtualStub
+    {
+        bail!("output.primary_target_device must not be empty for live output routing");
     }
 
     Ok(())
@@ -405,24 +475,16 @@ fn embedded_config_contents(path: &Path) -> Option<&'static str> {
 fn embedded_config_presets() -> &'static [EmbeddedConfigPreset] {
     &[
         EmbeddedConfigPreset {
-            path: "configs/node-a.toml",
-            contents: include_str!("../../../configs/node-a.toml"),
+            path: "configs/master.toml",
+            contents: include_str!("../../../configs/master.toml"),
         },
         EmbeddedConfigPreset {
-            path: "configs/node-b.toml",
-            contents: include_str!("../../../configs/node-b.toml"),
+            path: "configs/slave.toml",
+            contents: include_str!("../../../configs/slave.toml"),
         },
         EmbeddedConfigPreset {
-            path: "configs/node-a-mock.toml",
-            contents: include_str!("../../../configs/node-a-mock.toml"),
-        },
-        EmbeddedConfigPreset {
-            path: "configs/node-a-wasapi-wav.toml",
-            contents: include_str!("../../../configs/node-a-wasapi-wav.toml"),
-        },
-        EmbeddedConfigPreset {
-            path: "configs/node-a-mock-render.toml",
-            contents: include_str!("../../../configs/node-a-mock-render.toml"),
+            path: "configs/peer.toml",
+            contents: include_str!("../../../configs/peer.toml"),
         },
     ]
 }
@@ -728,7 +790,7 @@ mod tests {
     fn save_and_reload_config_round_trip_preserves_device_fields() {
         let mut config = NodeConfig::default();
         config.audio.input_device = "default".to_owned();
-        config.output.target_device = "CABLE Input (VB-Audio Virtual Cable)".to_owned();
+        config.output.primary_target_device = "CABLE Input (VB-Audio Virtual Cable)".to_owned();
 
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -742,7 +804,7 @@ mod tests {
 
         assert_eq!(reloaded.audio.input_device, "default");
         assert_eq!(
-            reloaded.output.target_device,
+            reloaded.output.primary_target_device,
             "CABLE Input (VB-Audio Virtual Cable)"
         );
     }
@@ -756,10 +818,10 @@ mod tests {
         fs::create_dir_all(workspace.join("crates")).expect("crates dir should create");
         fs::create_dir_all(&search_root).expect("search root should create");
         fs::write(workspace.join("Cargo.toml"), "[workspace]\n").expect("Cargo.toml should write");
-        fs::write(configs_dir.join("node-a.toml"), "").expect("config file should write");
+        fs::write(configs_dir.join("master.toml"), "").expect("config file should write");
 
-        let resolved = resolve_config_path_from(Path::new("configs/node-a.toml"), &[search_root]);
-        assert_eq!(resolved, workspace.join("configs").join("node-a.toml"));
+        let resolved = resolve_config_path_from(Path::new("configs/master.toml"), &[search_root]);
+        assert_eq!(resolved, workspace.join("configs").join("master.toml"));
 
         fs::remove_dir_all(workspace).expect("temp workspace should be removable");
     }
@@ -787,21 +849,16 @@ mod tests {
         let isolated = unique_temp_dir("embedded_preset");
         fs::create_dir_all(&isolated).expect("isolated temp dir should create");
 
-        let config = load_config_from(Path::new("configs/node-a-mock.toml"), &[isolated.clone()])
+        let config = load_config_from(Path::new("configs/peer.toml"), &[isolated.clone()])
             .expect("embedded preset should load without on-disk config");
 
-        assert_eq!(config.node.name, "node-a-mock");
-        assert!(
-            config
-                .debug
-                .dump_dir
-                .ends_with(Path::new("artifacts/windows-mock"))
-        );
+        assert_eq!(config.node.name, "peer");
+        assert!(config.debug.dump_dir.ends_with(Path::new("artifacts/peer")));
         assert!(
             config
                 .output
                 .wav_path
-                .ends_with(Path::new("artifacts/windows-mock/processed-output.wav"))
+                .ends_with(Path::new("artifacts/peer/processed-output.wav"))
         );
 
         fs::remove_dir_all(isolated).expect("isolated temp dir should be removable");
@@ -825,8 +882,8 @@ mod tests {
     #[test]
     fn discover_config_presets_uses_embedded_list_without_workspace() {
         let presets = embedded_config_preset_names();
-        assert!(presets.contains(&"configs/node-a.toml".to_owned()));
-        assert!(presets.contains(&"configs/node-a-mock.toml".to_owned()));
+        assert!(presets.contains(&"configs/master.toml".to_owned()));
+        assert!(presets.contains(&"configs/peer.toml".to_owned()));
     }
 
     #[test]
@@ -854,15 +911,18 @@ mod tests {
         fs::create_dir_all(workspace.join("crates")).expect("crates dir should create");
         fs::write(workspace.join("Cargo.toml"), "[workspace]\n").expect("Cargo.toml should write");
 
-        let base = include_str!("../../../configs/node-a.toml").to_owned();
+        let base = include_str!("../../../configs/master.toml").to_owned();
         let mut different_config = NodeConfig::default();
-        different_config.node.name = "incoming-node-a".to_owned();
+        different_config.node.name = "incoming-master".to_owned();
+        different_config.node.session_mode = SessionMode::MasterSlave;
+        different_config.node.role = NodeRole::Master;
+        different_config.output.routing = OutputRoutingMode::MixToPrimary;
         different_config.audio.input_device = "default".to_owned();
         let different =
             toml::to_string_pretty(&different_config).expect("different config should serialize");
-        fs::write(configs_dir.join("node-a.toml"), &base).expect("existing config should write");
+        fs::write(configs_dir.join("master.toml"), &base).expect("existing config should write");
         fs::write(import_dir.join("copy.toml"), &base).expect("duplicate config should write");
-        fs::write(import_dir.join("node-a.toml"), &different)
+        fs::write(import_dir.join("master.toml"), &different)
             .expect("conflict config should write");
 
         let preview =
@@ -871,8 +931,8 @@ mod tests {
 
         assert_eq!(preview.skipped_duplicates, vec!["copy.toml"]);
         assert_eq!(preview.conflicts.len(), 1);
-        assert_eq!(preview.conflicts[0].existing_path, "configs/node-a.toml");
-        assert_eq!(preview.conflicts[0].suggested_path, "configs/node-a-1.toml");
+        assert_eq!(preview.conflicts[0].existing_path, "configs/master.toml");
+        assert_eq!(preview.conflicts[0].suggested_path, "configs/master-1.toml");
 
         fs::remove_dir_all(workspace).expect("temp workspace should be removable");
     }
@@ -912,6 +972,37 @@ mod tests {
             error
                 .to_string()
                 .contains("cancel.anti_phase_smoothing must be in [0, 1)"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn validate_config_rejects_invalid_role_for_session_mode() {
+        let mut config = NodeConfig::default();
+        config.node.session_mode = SessionMode::MasterSlave;
+        config.node.role = NodeRole::Peer;
+
+        let error = validate_config(&config).expect_err("peer role in master_slave should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("master_slave mode only allows role=master or role=slave"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn validate_config_rejects_invalid_routing_for_peer_mode() {
+        let mut config = NodeConfig::default();
+        config.node.session_mode = SessionMode::Peer;
+        config.node.role = NodeRole::Peer;
+        config.output.routing = OutputRoutingMode::MixToPrimary;
+
+        let error = validate_config(&config).expect_err("peer mode mix should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("peer mode only allows output.routing = local_only"),
             "unexpected error: {error}"
         );
     }

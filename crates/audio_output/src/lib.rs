@@ -100,7 +100,9 @@ fn build_virtual_output_sink(config: &OutputConfig) -> Result<Box<dyn OutputSink
 
 #[cfg(not(windows))]
 fn build_virtual_output_sink(config: &OutputConfig) -> Result<Box<dyn OutputSink>> {
-    Ok(Box::new(VirtualMicStub::new(config.target_device.clone())))
+    Ok(Box::new(VirtualMicStub::new(
+        config.primary_target_device.clone(),
+    )))
 }
 
 pub struct NullOutputSink;
@@ -171,7 +173,7 @@ impl WindowsRenderSink {
                     .context("failed to create MMDeviceEnumerator for output")?
             };
 
-            let device = select_render_device(&enumerator, &config.target_device)?;
+            let device = select_render_device(&enumerator, &config.primary_target_device)?;
             let device_name = render_device_name(&device)
                 .or_else(|_| render_device_id(&device))
                 .unwrap_or_else(|_| "wasapi-render".to_owned());

@@ -8,14 +8,14 @@ use audio_capture::list_capture_devices;
 #[cfg(windows)]
 use audio_output::list_render_devices;
 use common_types::{
-    AudioBackend, AudioDeviceInfo, OutputBackend, RuntimeSnapshot, TransportBackend,
+    AudioBackend, AudioDeviceInfo, NodeRole, OutputBackend, OutputRoutingMode, RuntimeSnapshot,
+    SessionMode, TransportBackend,
 };
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui;
 #[cfg(windows)]
 use rfd::FileDialog;
 use std::collections::VecDeque;
-use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,6 +29,10 @@ const WORKER_SLEEP_SLICE: Duration = Duration::from_millis(50);
 const METRIC_HISTORY_LIMIT: usize = 240;
 const WINDOWS_UI_REGULAR_FAMILY: &str = "windows_ui_regular";
 const WINDOWS_UI_BOLD_FAMILY: &str = "windows_ui_bold";
+const SOURCE_HAN_SANS_CN_REGULAR: &[u8] =
+    include_bytes!("../../../assets/fonts/SourceHanSansCN-Regular.otf");
+const SOURCE_HAN_SANS_CN_BOLD: &[u8] =
+    include_bytes!("../../../assets/fonts/SourceHanSansCN-Bold.otf");
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum UiLanguage {
@@ -48,6 +52,7 @@ impl UiLanguage {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum MetricsPanelSize {
+    Minimal,
     #[default]
     Compact,
     Medium,
@@ -92,14 +97,22 @@ struct NoiseControlUiState {
 impl MetricsPanelSize {
     fn label(self, language: UiLanguage) -> &'static str {
         match self {
-            Self::Compact => localized(language, "Small", "小"),
-            Self::Medium => localized(language, "Medium", "中"),
-            Self::Large => localized(language, "Large", "大"),
+            Self::Minimal => localized(language, "Minimal", "极简"),
+            Self::Compact => localized(language, "Default", "默认"),
+            Self::Medium => localized(language, "Large", "大"),
+            Self::Large => localized(language, "Huge", "我瞎了"),
         }
     }
 
     fn layout(self) -> MetricsLayout {
         match self {
+            Self::Minimal => MetricsLayout {
+                stat_columns: 2,
+                panel_columns: 2,
+                stat_card_height: 0.0,
+                chart_height: 0.0,
+                progress_bar_height: 0.0,
+            },
             Self::Compact => MetricsLayout {
                 stat_columns: 4,
                 panel_columns: 4,
@@ -135,7 +148,7 @@ pub fn run_native() -> eframe::Result<()> {
         "EK Dual Mic",
         options,
         Box::new(|cc| {
-            install_windows_cjk_font_fallback(&cc.egui_ctx);
+            install_embedded_ui_font_chain(&cc.egui_ctx);
             Ok(Box::new(NodeGuiApp::default()))
         }),
     )
@@ -187,8 +200,12 @@ pub struct NodeGuiApp {
     render_devices: Vec<AudioDeviceInfo>,
     listen_addr_value: String,
     peer_addr_value: String,
+    session_mode_value: SessionMode,
+    role_value: NodeRole,
     input_device_value: String,
     target_device_value: String,
+    secondary_target_device_value: String,
+    output_routing_value: OutputRoutingMode,
     monitor_processed_output_value: bool,
     cancel_step_size_value: f32,
     cancel_update_threshold_value: f32,
@@ -215,7 +232,7 @@ impl Default for NodeGuiApp {
     fn default() -> Self {
         let mut app = Self {
             language: UiLanguage::Chinese,
-            config_path: "configs/node-a.toml".to_owned(),
+            config_path: "configs/peer.toml".to_owned(),
             config_presets: Vec::new(),
             status: "Idle".to_owned(),
             active_tab: MainTab::Metrics,
@@ -227,8 +244,12 @@ impl Default for NodeGuiApp {
             render_devices: Vec::new(),
             listen_addr_value: String::new(),
             peer_addr_value: String::new(),
+            session_mode_value: SessionMode::Peer,
+            role_value: NodeRole::Peer,
             input_device_value: String::new(),
             target_device_value: String::new(),
+            secondary_target_device_value: String::new(),
+            output_routing_value: OutputRoutingMode::LocalOnly,
             monitor_processed_output_value: true,
             cancel_step_size_value: 0.06,
             cancel_update_threshold_value: 0.48,
@@ -305,6 +326,8 @@ impl NodeGuiApp {
         self.loaded_output_backend = Some(config.output.backend);
         info!(
             node = %config.node.name,
+            session_mode = ?config.node.session_mode,
+            role = ?config.node.role,
             listen = %config.node.listen_addr,
             peer = %config.node.peer_addr,
             audio = backend_label_audio(config.audio.backend),
@@ -313,13 +336,16 @@ impl NodeGuiApp {
             "GUI loaded config metadata"
         );
         self.config_mode_summary = Some(format!(
-            "node={}, listen={}, peer={}, audio={}, transport={}, output={}",
+            "node={}, mode={:?}, role={:?}, listen={}, peer={}, audio={}, transport={}, output={}, routing={:?}",
             config.node.name,
+            config.node.session_mode,
+            config.node.role,
             config.node.listen_addr,
             config.node.peer_addr,
             backend_label_audio(config.audio.backend),
             backend_label_transport(config.node.transport_backend),
             backend_label_output(config.output.backend),
+            config.output.routing,
         ));
         self.config_mode_warning = if config.audio.backend == AudioBackend::Mock {
             Some(
@@ -340,8 +366,8 @@ impl NodeGuiApp {
         } else if config.output.backend != OutputBackend::VirtualStub {
             Some(
                 self.ui_text(
-                    "Current config does not write to a live output device. `target_device` is ignored in this mode.",
-                    "当前配置不会写入实时输出设备，`target_device` 在该模式下会被忽略。",
+                    "Current config does not write to a live output device. The primary output device is ignored in this mode.",
+                    "当前配置不会写入实时输出设备，主输出设备在该模式下会被忽略。",
                 )
                 .to_owned(),
             )
@@ -373,6 +399,31 @@ impl NodeGuiApp {
         }
     }
 
+    fn session_mode_label(&self, mode: SessionMode) -> &'static str {
+        match mode {
+            SessionMode::MasterSlave => self.ui_text("Master/Slave", "主从"),
+            SessionMode::Peer => self.ui_text("Peer/Peer", "对等"),
+            SessionMode::Both => self.ui_text("Both/Both", "双向"),
+        }
+    }
+
+    fn node_role_label(&self, role: NodeRole) -> &'static str {
+        match role {
+            NodeRole::Master => self.ui_text("Master", "主机"),
+            NodeRole::Slave => self.ui_text("Slave", "从机"),
+            NodeRole::Peer => self.ui_text("Peer", "对等"),
+        }
+    }
+
+    fn output_routing_label(&self, routing: OutputRoutingMode) -> &'static str {
+        match routing {
+            OutputRoutingMode::LocalOnly => self.ui_text("Local Only", "仅本地"),
+            OutputRoutingMode::Off => self.ui_text("Off", "关闭输出"),
+            OutputRoutingMode::MixToPrimary => self.ui_text("Mix To Primary", "混音到主输出"),
+            OutputRoutingMode::SplitLocalPeer => self.ui_text("Split Local/Peer", "本地/对端分离"),
+        }
+    }
+
     fn draw_capture_device_dropdown(&mut self, ui: &mut egui::Ui) -> bool {
         let default_label = self.ui_text("Default Capture", "默认输入").to_owned();
         let before = self.input_device_value.clone();
@@ -396,27 +447,33 @@ impl NodeGuiApp {
         self.input_device_value != before
     }
 
-    fn draw_render_device_dropdown(&mut self, ui: &mut egui::Ui) -> bool {
-        let default_label = self.ui_text("Default Render", "默认输出").to_owned();
-        let before = self.target_device_value.clone();
-        egui::ComboBox::from_id_salt("render_device_combo")
-            .selected_text(self.selected_device_text(&self.target_device_value))
+    fn draw_render_device_dropdown(
+        ui: &mut egui::Ui,
+        id_salt: &str,
+        value: &mut String,
+        render_devices: &[AudioDeviceInfo],
+        default_label: &str,
+        select_prompt: &str,
+    ) -> bool {
+        let before = value.clone();
+        egui::ComboBox::from_id_salt(id_salt)
+            .selected_text(if value.trim().is_empty() {
+                select_prompt.to_owned()
+            } else {
+                value.to_owned()
+            })
             .width(safe_available_width(ui, 220.0))
             .show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut self.target_device_value,
-                    "default".to_owned(),
-                    default_label,
-                );
-                for device in &self.render_devices {
+                ui.selectable_value(value, "default".to_owned(), default_label.to_owned());
+                for device in render_devices {
                     ui.selectable_value(
-                        &mut self.target_device_value,
+                        value,
                         device.name.clone(),
                         format_device_label(device),
                     );
                 }
-        });
-        self.target_device_value != before
+            });
+        *value != before
     }
 
     fn draw_noise_reduction_controls(&mut self, ui: &mut egui::Ui) -> NoiseControlUiState {
@@ -436,9 +493,7 @@ impl NodeGuiApp {
         let anti_phase_smoothing_label = self
             .ui_text("Anti-phase smoothing", "反向波平滑")
             .to_owned();
-        let residual_strength_label = self
-            .ui_text("Residual strength", "残余抑制强度")
-            .to_owned();
+        let residual_strength_label = self.ui_text("Residual strength", "残余抑制强度").to_owned();
         let monitor_processed_hint = self.ui_text(
             "On: hear the processed result. Off: hear the raw capture path for troubleshooting.",
             "打开：听处理后的结果。关闭：听原始采集链，适合排查问题。",
@@ -766,8 +821,12 @@ impl NodeGuiApp {
                 self.sync_loaded_config_metadata(&config);
                 self.listen_addr_value = config.node.listen_addr;
                 self.peer_addr_value = config.node.peer_addr;
+                self.session_mode_value = config.node.session_mode;
+                self.role_value = config.node.role;
                 self.input_device_value = config.audio.input_device;
-                self.target_device_value = config.output.target_device;
+                self.target_device_value = config.output.primary_target_device;
+                self.secondary_target_device_value = config.output.secondary_target_device;
+                self.output_routing_value = config.output.routing;
                 self.monitor_processed_output_value = config.output.monitor_processed_output;
                 self.cancel_step_size_value = config.cancel.step_size;
                 self.cancel_update_threshold_value = config.cancel.update_threshold;
@@ -820,8 +879,13 @@ impl NodeGuiApp {
                 );
                 let peer_addr =
                     Self::normalized_socket_field(&self.peer_addr_value, &config.node.peer_addr);
+                let session_mode = self.session_mode_value;
+                let role = self.role_value;
                 let input_device = Self::normalized_device_field(&self.input_device_value);
                 let target_device = Self::normalized_device_field(&self.target_device_value);
+                let secondary_target_device =
+                    Self::normalized_device_field(&self.secondary_target_device_value);
+                let output_routing = self.output_routing_value;
                 let monitor_processed_output = self.monitor_processed_output_value;
                 let cancel_step_size = self.cancel_step_size_value.clamp(0.001, 0.2);
                 let cancel_update_threshold = self.cancel_update_threshold_value.clamp(0.0, 0.99);
@@ -832,8 +896,12 @@ impl NodeGuiApp {
                 let residual_strength = self.residual_strength_value.clamp(0.0, 1.0);
                 let changed = config.node.listen_addr != listen_addr
                     || config.node.peer_addr != peer_addr
+                    || config.node.session_mode != session_mode
+                    || config.node.role != role
                     || config.audio.input_device != input_device
-                    || config.output.target_device != target_device
+                    || config.output.primary_target_device != target_device
+                    || config.output.secondary_target_device != secondary_target_device
+                    || config.output.routing != output_routing
                     || config.output.monitor_processed_output != monitor_processed_output
                     || (config.cancel.step_size - cancel_step_size).abs() > f32::EPSILON
                     || (config.cancel.update_threshold - cancel_update_threshold).abs()
@@ -848,8 +916,12 @@ impl NodeGuiApp {
 
                 config.node.listen_addr = listen_addr.clone();
                 config.node.peer_addr = peer_addr.clone();
+                config.node.session_mode = session_mode;
+                config.node.role = role;
                 config.audio.input_device = input_device;
-                config.output.target_device = target_device;
+                config.output.primary_target_device = target_device;
+                config.output.secondary_target_device = secondary_target_device.clone();
+                config.output.routing = output_routing;
                 config.output.monitor_processed_output = monitor_processed_output;
                 config.cancel.step_size = cancel_step_size;
                 config.cancel.update_threshold = cancel_update_threshold;
@@ -860,6 +932,7 @@ impl NodeGuiApp {
                 config.residual.strength = residual_strength;
                 self.listen_addr_value = listen_addr;
                 self.peer_addr_value = peer_addr;
+                self.secondary_target_device_value = secondary_target_device;
                 self.cancel_step_size_value = cancel_step_size;
                 self.cancel_update_threshold_value = cancel_update_threshold;
                 self.anti_phase_max_gain_value = anti_phase_max_gain;
@@ -946,6 +1019,18 @@ impl NodeGuiApp {
     fn load_selected_config_path(&mut self, config_path: String) {
         self.config_path = config_path;
         self.reload_config_fields();
+    }
+
+    fn load_peer_variant_preset(
+        &mut self,
+        session_mode: SessionMode,
+        routing: OutputRoutingMode,
+    ) {
+        self.load_selected_config_path("configs/peer.toml".to_owned());
+        self.session_mode_value = session_mode;
+        self.role_value = NodeRole::Peer;
+        self.output_routing_value = routing;
+        self.save_runtime_fields();
     }
 
     fn request_runtime_reload(&mut self) -> bool {
@@ -1068,10 +1153,134 @@ impl Drop for NodeGuiApp {
 
 impl NodeGuiApp {
     fn draw_metrics_dashboard(&self, ui: &mut egui::Ui, snapshot: &RuntimeSnapshot) {
+        if self.metrics_panel_size == MetricsPanelSize::Minimal {
+            self.draw_minimal_metrics_dashboard(ui, snapshot);
+            return;
+        }
+
         let layout = self.metrics_layout();
         self.draw_metrics_stat_cards(ui, snapshot, layout);
         ui.add_space(6.0);
         self.draw_metrics_panel_grid(ui, snapshot, layout);
+    }
+
+    fn draw_minimal_metrics_dashboard(&self, ui: &mut egui::Ui, snapshot: &RuntimeSnapshot) {
+        let attenuation = attenuation_ratio(snapshot.input_rms, snapshot.output_rms);
+        let update_state = if snapshot.update_frozen {
+            self.ui_text("Frozen", "冻结")
+        } else {
+            self.ui_text("Adaptive", "自适应")
+        };
+        let minimal_sections = [
+            (
+                self.ui_text("Overview", "概览"),
+                vec![
+                    (
+                        self.ui_text("Node", "节点").to_owned(),
+                        snapshot.node_name.clone(),
+                    ),
+                    (
+                        self.ui_text("Sequence", "序号").to_owned(),
+                        snapshot.sequence.to_string(),
+                    ),
+                    (
+                        self.ui_text("Delay", "延迟").to_owned(),
+                        format!("{:.1} ms", snapshot.coarse_delay_ms),
+                    ),
+                    (
+                        self.ui_text("Frame Time", "帧耗时").to_owned(),
+                        format!("{} us", snapshot.processing_time_us),
+                    ),
+                    (
+                        self.ui_text("Update State", "更新状态").to_owned(),
+                        update_state.to_owned(),
+                    ),
+                ],
+            ),
+            (
+                self.ui_text("Audio Levels", "音频电平"),
+                vec![
+                    (
+                        self.ui_text("Input RMS", "输入 RMS").to_owned(),
+                        format!("{:.5}", snapshot.input_rms),
+                    ),
+                    (
+                        self.ui_text("Output RMS", "输出 RMS").to_owned(),
+                        format!("{:.5}", snapshot.output_rms),
+                    ),
+                    (
+                        self.ui_text("Crosstalk", "串音").to_owned(),
+                        format!("{:.5}", snapshot.estimated_crosstalk_rms),
+                    ),
+                    (
+                        self.ui_text("Attenuation", "衰减").to_owned(),
+                        format!("{:.1}%", attenuation * 100.0),
+                    ),
+                ],
+            ),
+            (
+                self.ui_text("Sync And Voice Activity", "同步与语音活动"),
+                vec![
+                    (
+                        self.ui_text("Coherence", "相干性").to_owned(),
+                        format!("{:.3}", snapshot.coherence),
+                    ),
+                    (
+                        self.ui_text("Local VAD", "本地 VAD").to_owned(),
+                        format!("{:.3}", snapshot.local_vad.score),
+                    ),
+                    (
+                        self.ui_text("Peer VAD", "对端 VAD").to_owned(),
+                        format!("{:.3}", snapshot.peer_vad.score),
+                    ),
+                    (
+                        self.ui_text("Drift", "漂移").to_owned(),
+                        format!("{:.2} ppm", snapshot.drift_ppm),
+                    ),
+                ],
+            ),
+            (
+                self.ui_text("Transport And Timing", "传输与耗时"),
+                vec![
+                    (
+                        self.ui_text("Transport Loss", "传输丢失").to_owned(),
+                        format!("{:.2}%", snapshot.transport_loss_rate * 100.0),
+                    ),
+                    (
+                        self.ui_text("Clip Events", "削波次数").to_owned(),
+                        snapshot.clip_events.to_string(),
+                    ),
+                    (
+                        self.ui_text("Sent / Received", "发送 / 接收").to_owned(),
+                        format!(
+                            "{} / {}",
+                            snapshot.sent_packets, snapshot.received_packets
+                        ),
+                    ),
+                    (
+                        self.ui_text("Concealed", "已补偿").to_owned(),
+                        snapshot.concealed_packets.to_string(),
+                    ),
+                ],
+            ),
+        ];
+
+        ui.small(self.ui_text(
+            "Minimal mode hides charts and bars and only keeps text summaries.",
+            "极简模式会隐藏图表和进度条，只保留文字摘要。",
+        ));
+        ui.add_space(6.0);
+
+        for row_start in (0..minimal_sections.len()).step_by(2) {
+            let row_len = (minimal_sections.len() - row_start).min(2);
+            self.draw_metric_row(ui, row_len, |column_index, column| {
+                let (title, rows) = &minimal_sections[row_start + column_index];
+                draw_minimal_metric_section(column, title, rows);
+            });
+            if row_start + row_len < minimal_sections.len() {
+                ui.add_space(6.0);
+            }
+        }
     }
 
     fn draw_metrics_stat_cards(
@@ -1329,6 +1538,10 @@ impl NodeGuiApp {
             egui::Color32::from_rgb(255, 120, 117),
             layout.progress_bar_height,
         );
+        ui.small(self.ui_text(
+            "Calculated over the most recent 2400 transport frames. The chart itself still only draws the most recent 240 runtime snapshots.",
+            "按最近 2400 个传输帧计算。图表本身仍只显示最近 240 个运行时快照。",
+        ));
         draw_progress_metric(
             ui,
             self.ui_text("Clip Events", "削波次数"),
@@ -1441,23 +1654,46 @@ impl NodeGuiApp {
 
         ui.horizontal_wrapped(|ui| {
             if ui
-                .button(self.ui_text("Load Capture-To-WAV Preset", "加载仅录 WAV 预设"))
+                .button(self.ui_text("Load Master Preset", "加载主机预设"))
                 .clicked()
             {
-                self.load_selected_config_path("configs/node-a-wasapi-wav.toml".to_owned());
+                self.load_selected_config_path("configs/master.toml".to_owned());
             }
             if ui
-                .button(self.ui_text("Load Live Monitor Preset", "加载实时监听预设"))
+                .button(self.ui_text("Load Slave Preset", "加载从机预设"))
                 .clicked()
             {
-                self.load_selected_config_path("configs/node-a.toml".to_owned());
+                self.load_selected_config_path("configs/slave.toml".to_owned());
             }
-            if ui
-                .button(self.ui_text("Load Mock Render Preset", "加载 Mock 输出预设"))
-                .clicked()
-            {
-                self.load_selected_config_path("configs/node-a-mock-render.toml".to_owned());
-            }
+            ui.menu_button(self.ui_text("Load Peer Preset", "加载对等预设"), |ui| {
+                if ui
+                    .button(self.ui_text("Peer/Peer", "对等/对等"))
+                    .clicked()
+                {
+                    self.load_peer_variant_preset(SessionMode::Peer, OutputRoutingMode::LocalOnly);
+                    ui.close();
+                }
+                if ui
+                    .button(self.ui_text("Both/Both (Mix)", "双向/双向（混音）"))
+                    .clicked()
+                {
+                    self.load_peer_variant_preset(
+                        SessionMode::Both,
+                        OutputRoutingMode::MixToPrimary,
+                    );
+                    ui.close();
+                }
+                if ui
+                    .button(self.ui_text("Both/Both (Split)", "双向/双向（分离）"))
+                    .clicked()
+                {
+                    self.load_peer_variant_preset(
+                        SessionMode::Both,
+                        OutputRoutingMode::SplitLocalPeer,
+                    );
+                    ui.close();
+                }
+            });
         });
 
         ui.add_space(8.0);
@@ -1502,14 +1738,30 @@ impl NodeGuiApp {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(self.ui_text("Current I/O", "当前输入输出"));
             ui.small(format!(
+                "{}: {} / {}",
+                self.ui_text("Mode / Role", "模式 / 角色"),
+                self.session_mode_label(self.session_mode_value),
+                self.node_role_label(self.role_value)
+            ));
+            ui.small(format!(
                 "{}: {}",
                 self.ui_text("Input Device", "输入设备"),
                 self.input_device_value
             ));
             ui.small(format!(
                 "{}: {}",
-                self.ui_text("Output Target", "输出目标"),
+                self.ui_text("Primary Output", "主输出"),
                 self.target_device_value
+            ));
+            ui.small(format!(
+                "{}: {}",
+                self.ui_text("Secondary Output", "第二输出"),
+                self.secondary_target_device_value
+            ));
+            ui.small(format!(
+                "{}: {}",
+                self.ui_text("Output Routing", "输出路由"),
+                self.output_routing_label(self.output_routing_value)
             ));
             ui.small(format!(
                 "{}: {}",
@@ -1605,7 +1857,6 @@ impl eframe::App for NodeGuiApp {
                 });
                 ui.separator();
                 ui.heading("EK Dual Mic");
-                ui.label(self.ui_text("Windows-only realtime scaffold", "仅限 Windows 的实时框架"));
             });
         });
 
@@ -1619,65 +1870,48 @@ impl eframe::App for NodeGuiApp {
                     let mut capture_device_changed = false;
                     let mut render_device_changed = false;
 
-                    ui.label(self.ui_text("Config Path", "配置路径"));
-                    ui.text_edit_singleline(&mut self.config_path);
-                        ui.horizontal(|ui| {
-                            ui.menu_button(self.ui_text("Load Config", "加载配置"), |ui| {
-                                let presets = self.config_presets.clone();
-                                if presets.is_empty() {
-                                    ui.small(self.ui_text(
-                                        "No config presets found.",
-                                        "未找到配置预设。",
-                                    ));
-                                } else {
-                                    for preset in presets {
-                                        if ui.button(&preset).clicked() {
-                                            self.load_selected_config_path(preset);
-                                            ui.close();
-                                        }
+                    ui.label(self.ui_text("Config File", "配置文件"));
+                    egui::ComboBox::from_id_salt("config_path_combo")
+                        .selected_text(if self.config_path.trim().is_empty() {
+                            self.ui_text("Select config", "选择配置").to_owned()
+                        } else {
+                            self.config_path.clone()
+                        })
+                        .width(safe_available_width(ui, 280.0))
+                        .show_ui(ui, |ui| {
+                            let presets = self.config_presets.clone();
+                            if presets.is_empty() {
+                                ui.small(self.ui_text(
+                                    "No config presets found.",
+                                    "未找到配置预设。",
+                                ));
+                            } else {
+                                for preset in presets {
+                                    let is_selected = self.config_path == preset;
+                                    if ui.selectable_label(is_selected, &preset).clicked() {
+                                        self.load_selected_config_path(preset);
+                                        ui.close();
                                     }
                                 }
-
-                                ui.separator();
-                                if ui
-                                    .button(self.ui_text(
-                                        "Import Config Folder",
-                                        "导入配置文件夹",
-                                    ))
-                                    .clicked()
-                                {
-                                    self.pick_and_import_config_folder();
-                                    ui.close();
-                                }
-                                if ui
-                                    .button(self.ui_text("Refresh Config List", "刷新配置列表"))
-                                    .clicked()
-                                {
-                                    self.refresh_config_presets();
-                                }
-                            });
-                            if ui
-                                .button(self.ui_text("Refresh Configs", "刷新配置"))
-                                .clicked()
-                            {
-                                self.refresh_config_presets();
-                            }
-                            if ui
-                                .button(self.ui_text(
-                                    "Import Config Folder",
-                                    "导入配置文件夹",
-                                ))
-                                .clicked()
-                            {
-                                self.pick_and_import_config_folder();
-                            }
-                            if ui
-                                .button(self.ui_text("Save Runtime Fields", "保存运行时字段"))
-                                .clicked()
-                            {
-                                self.save_runtime_fields();
                             }
                         });
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(self.ui_text(
+                                "Import Config Folder",
+                                "导入配置文件夹",
+                            ))
+                            .clicked()
+                        {
+                            self.pick_and_import_config_folder();
+                        }
+                        if ui
+                            .button(self.ui_text("Save Runtime Fields", "保存运行时字段"))
+                            .clicked()
+                        {
+                            self.save_runtime_fields();
+                        }
+                    });
                         if let Some(error) = &self.config_discovery_error {
                             ui.small(format!(
                                 "{}: {error}",
@@ -1722,6 +1956,40 @@ impl eframe::App for NodeGuiApp {
                             ));
                         }
 
+                        ui.label(self.ui_text("Session Mode", "会话模式"));
+                        egui::ComboBox::from_id_salt("session_mode_combo")
+                            .selected_text(self.session_mode_label(self.session_mode_value))
+                            .width(safe_available_width(ui, 220.0))
+                            .show_ui(ui, |ui| {
+                                for mode in [
+                                    SessionMode::MasterSlave,
+                                    SessionMode::Peer,
+                                    SessionMode::Both,
+                                ] {
+                                    let label = self.session_mode_label(mode).to_owned();
+                                    ui.selectable_value(
+                                        &mut self.session_mode_value,
+                                        mode,
+                                        label,
+                                    );
+                                }
+                            });
+
+                        ui.label(self.ui_text("Role", "角色"));
+                        egui::ComboBox::from_id_salt("node_role_combo")
+                            .selected_text(self.node_role_label(self.role_value))
+                            .width(safe_available_width(ui, 220.0))
+                            .show_ui(ui, |ui| {
+                                for role in [NodeRole::Master, NodeRole::Slave, NodeRole::Peer] {
+                                    let label = self.node_role_label(role).to_owned();
+                                    ui.selectable_value(
+                                        &mut self.role_value,
+                                        role,
+                                        label,
+                                    );
+                                }
+                            });
+
                         ui.label(self.ui_text("Audio Input Device", "音频输入设备"));
                         ui.add_enabled_ui(self.capture_selection_enabled(), |ui| {
                             capture_device_changed |= self.draw_capture_device_dropdown(ui);
@@ -1733,14 +2001,67 @@ impl eframe::App for NodeGuiApp {
                             ));
                         }
 
-                        ui.label(self.ui_text("Output Target Device", "输出目标设备"));
+                        ui.label(self.ui_text("Output Routing", "输出路由"));
+                        egui::ComboBox::from_id_salt("output_routing_combo")
+                            .selected_text(self.output_routing_label(self.output_routing_value))
+                            .width(safe_available_width(ui, 220.0))
+                            .show_ui(ui, |ui| {
+                                for routing in [
+                                    OutputRoutingMode::LocalOnly,
+                                    OutputRoutingMode::Off,
+                                    OutputRoutingMode::MixToPrimary,
+                                    OutputRoutingMode::SplitLocalPeer,
+                                ] {
+                                    let label = self.output_routing_label(routing).to_owned();
+                                    ui.selectable_value(
+                                        &mut self.output_routing_value,
+                                        routing,
+                                        label,
+                                    );
+                                }
+                            });
+
+                        let render_devices = self.render_devices.clone();
+                        let default_render_label =
+                            self.ui_text("Default Render", "默认输出").to_owned();
+                        let select_device_prompt =
+                            self.ui_text("Select a device", "选择设备").to_owned();
+                        ui.label(self.ui_text("Primary Output Device", "主输出设备"));
                         ui.add_enabled_ui(self.render_selection_enabled(), |ui| {
-                            render_device_changed |= self.draw_render_device_dropdown(ui);
+                            render_device_changed |= Self::draw_render_device_dropdown(
+                                ui,
+                                "primary_render_device_combo",
+                                &mut self.target_device_value,
+                                &render_devices,
+                                &default_render_label,
+                                &select_device_prompt,
+                            );
                         });
                         if !self.render_selection_enabled() {
                             ui.small(self.ui_text(
                                 "Ignored because this config writes to WAV/null instead of a live output endpoint.",
                                 "当前配置写入的是 WAV/null，而不是实时输出端点，因此该字段会被忽略。",
+                            ));
+                        }
+                        ui.label(self.ui_text("Secondary Output Device", "第二输出设备"));
+                        ui.add_enabled_ui(
+                            self.render_selection_enabled()
+                                && self.output_routing_value == OutputRoutingMode::SplitLocalPeer,
+                            |ui| {
+                                render_device_changed |= Self::draw_render_device_dropdown(
+                                    ui,
+                                    "secondary_render_device_combo",
+                                    &mut self.secondary_target_device_value,
+                                    &render_devices,
+                                    &default_render_label,
+                                    &select_device_prompt,
+                                );
+                            },
+                        );
+                        if self.output_routing_value != OutputRoutingMode::SplitLocalPeer {
+                            ui.small(self.ui_text(
+                                "Used only when output routing is set to Split Local/Peer.",
+                                "仅在输出路由设为“本地/对端分离”时使用。",
                             ));
                         }
 
@@ -1803,12 +2124,6 @@ impl eframe::App for NodeGuiApp {
 
                         ui.separator();
                         ui.horizontal(|ui| {
-                            if ui
-                                .button(self.ui_text("Refresh Configs", "刷新配置"))
-                                .clicked()
-                            {
-                                self.refresh_config_presets();
-                            }
                             if ui
                                 .button(self.ui_text("Refresh Devices", "刷新设备"))
                                 .clicked()
@@ -1912,8 +2227,13 @@ impl eframe::App for NodeGuiApp {
                             ui.horizontal_wrapped(|ui| {
                                 ui.heading(self.ui_text("Realtime Metrics", "实时指标"));
                                 ui.separator();
-                                ui.label(self.ui_text("Metrics Size", "指标尺寸"));
+                                ui.label(
+                                    egui::RichText::new(self.ui_text("Size", "尺寸"))
+                                        .small()
+                                        .color(ui.visuals().weak_text_color()),
+                                );
                                 for size in [
+                                    MetricsPanelSize::Minimal,
                                     MetricsPanelSize::Compact,
                                     MetricsPanelSize::Medium,
                                     MetricsPanelSize::Large,
@@ -1925,10 +2245,24 @@ impl eframe::App for NodeGuiApp {
                                     );
                                 }
                             });
-                            ui.small(self.ui_text(
-                                "Default small mode shows four metric panels per row.",
-                                "默认小尺寸模式下一行显示 4 个指标面板。",
-                            ));
+                            ui.small(match self.metrics_panel_size {
+                                MetricsPanelSize::Minimal => self.ui_text(
+                                    "Minimal mode only keeps text summaries.",
+                                    "极简模式只保留文字摘要。",
+                                ),
+                                MetricsPanelSize::Compact => self.ui_text(
+                                    "Default mode shows four metric panels per row.",
+                                    "默认模式下一行显示 4 个指标面板。",
+                                ),
+                                MetricsPanelSize::Medium => self.ui_text(
+                                    "Large mode uses the old two-panel layout.",
+                                    "大模式使用原来的两列布局。",
+                                ),
+                                MetricsPanelSize::Large => self.ui_text(
+                                    "Huge mode uses the old single-column layout.",
+                                    "我瞎了模式使用原来的单列布局。",
+                                ),
+                            });
                             ui.separator();
 
                             if let Some(snapshot) = &self.latest {
@@ -2100,6 +2434,23 @@ fn draw_stat_card(ui: &mut egui::Ui, title: &str, value: &str, subtitle: &str, m
     });
 }
 
+fn draw_minimal_metric_section(ui: &mut egui::Ui, title: &str, rows: &[(String, String)]) {
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.label(title);
+        ui.add_space(4.0);
+        egui::Grid::new(title)
+            .num_columns(2)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                for (label, value) in rows {
+                    ui.small(label);
+                    ui.monospace(value);
+                    ui.end_row();
+                }
+            });
+    });
+}
+
 fn draw_progress_metric(
     ui: &mut egui::Ui,
     label: &str,
@@ -2262,102 +2613,69 @@ fn format_error_chain(error: &Error) -> String {
     message
 }
 
-fn install_windows_cjk_font_fallback(ctx: &egui::Context) {
-    let regular_paths = find_windows_cjk_font_chain(false);
-    if regular_paths.is_empty() {
-        warn!("no Windows CJK system font fallback found; Chinese text may render as tofu");
-        return;
-    }
-    let bold_paths = find_windows_cjk_font_chain(true);
-
+fn install_embedded_ui_font_chain(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    let regular_font_names =
-        register_windows_font_chain(&mut fonts, WINDOWS_UI_REGULAR_FAMILY, &regular_paths);
-    let bold_font_names = register_windows_font_chain(
-        &mut fonts,
-        WINDOWS_UI_BOLD_FAMILY,
-        if bold_paths.is_empty() {
-            &regular_paths
-        } else {
-            &bold_paths
-        },
+    let regular_font_name = "source_han_sans_cn_regular".to_owned();
+    let bold_font_name = "source_han_sans_cn_bold".to_owned();
+
+    fonts.font_data.insert(
+        regular_font_name.clone(),
+        egui::FontData::from_static(SOURCE_HAN_SANS_CN_REGULAR).into(),
     );
-    if regular_font_names.is_empty() || bold_font_names.is_empty() {
-        warn!("failed to load any Windows system UI fonts; Chinese text may render as tofu");
-        return;
-    }
+    fonts.font_data.insert(
+        bold_font_name.clone(),
+        egui::FontData::from_static(SOURCE_HAN_SANS_CN_BOLD).into(),
+    );
 
     fonts.families.insert(
         egui::FontFamily::Name(Arc::from(WINDOWS_UI_REGULAR_FAMILY)),
-        regular_font_names.clone(),
+        vec![regular_font_name.clone()],
     );
     fonts.families.insert(
         egui::FontFamily::Name(Arc::from(WINDOWS_UI_BOLD_FAMILY)),
-        bold_font_names.clone(),
+        vec![bold_font_name.clone()],
     );
     prepend_font_names(
         fonts
             .families
             .entry(egui::FontFamily::Proportional)
             .or_default(),
-        &regular_font_names,
+        &[regular_font_name.clone()],
     );
     prepend_font_names(
         fonts
             .families
             .entry(egui::FontFamily::Monospace)
             .or_default(),
-        &regular_font_names,
+        &[regular_font_name],
     );
     ctx.set_fonts(fonts);
 
     let mut style = (*ctx.style()).clone();
-    remap_text_style_family(&mut style, egui::TextStyle::Small, WINDOWS_UI_REGULAR_FAMILY);
+    remap_text_style_family(
+        &mut style,
+        egui::TextStyle::Small,
+        WINDOWS_UI_REGULAR_FAMILY,
+    );
     remap_text_style_family(&mut style, egui::TextStyle::Body, WINDOWS_UI_REGULAR_FAMILY);
-    remap_text_style_family(&mut style, egui::TextStyle::Button, WINDOWS_UI_REGULAR_FAMILY);
-    remap_text_style_family(&mut style, egui::TextStyle::Heading, WINDOWS_UI_REGULAR_FAMILY);
-    remap_text_style_family(&mut style, egui::TextStyle::Monospace, WINDOWS_UI_REGULAR_FAMILY);
+    remap_text_style_family(
+        &mut style,
+        egui::TextStyle::Button,
+        WINDOWS_UI_REGULAR_FAMILY,
+    );
+    remap_text_style_family(
+        &mut style,
+        egui::TextStyle::Heading,
+        WINDOWS_UI_REGULAR_FAMILY,
+    );
+    remap_text_style_family(
+        &mut style,
+        egui::TextStyle::Monospace,
+        WINDOWS_UI_REGULAR_FAMILY,
+    );
     ctx.set_style(style);
 
-    info!(
-        regular = ?regular_paths,
-        bold = ?bold_paths,
-        "installed Windows system font chain"
-    );
-}
-
-fn register_windows_font_chain(
-    fonts: &mut egui::FontDefinitions,
-    family_prefix: &str,
-    paths: &[PathBuf],
-) -> Vec<String> {
-    let mut font_names = Vec::new();
-    for (index, font_path) in paths.iter().enumerate() {
-        let font_bytes = match fs::read(font_path) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                warn!(
-                    path = %font_path.display(),
-                    %error,
-                    "failed to read Windows system font"
-                );
-                continue;
-            }
-        };
-        let font_name = format!(
-            "{family_prefix}_{index}_{}",
-            font_path
-                .file_stem()
-                .and_then(|name| name.to_str())
-                .unwrap_or("fallback")
-        );
-        fonts.font_data.insert(
-            font_name.clone(),
-            egui::FontData::from_owned(font_bytes).into(),
-        );
-        font_names.push(font_name);
-    }
-    font_names
+    info!("installed embedded Source Han Sans CN regular/bold font chain");
 }
 
 fn prepend_font_names(target: &mut Vec<String>, preferred_names: &[String]) {
@@ -2379,43 +2697,6 @@ fn remap_text_style_family(
             egui::FontId::new(current.size, egui::FontFamily::Name(Arc::from(family_name))),
         );
     }
-}
-
-fn find_windows_cjk_font_chain(bold: bool) -> Vec<PathBuf> {
-    let windows_dir = std::env::var_os("WINDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    let fonts_dir = windows_dir.join("Fonts");
-
-    windows_cjk_font_candidates(&fonts_dir, bold)
-        .into_iter()
-        .filter(|path| path.is_file())
-        .collect()
-}
-
-fn windows_cjk_font_candidates(fonts_dir: &Path, bold: bool) -> Vec<PathBuf> {
-    let names: &[&str] = if bold {
-        &[
-            "msyhbd.ttc",
-            "NotoSansSC-VF.ttf",
-            "simhei.ttf",
-            "simsunb.ttf",
-            "msyh.ttc",
-            "simsun.ttc",
-        ]
-    } else {
-        &[
-            "NotoSansSC-VF.ttf",
-            "msyh.ttc",
-            "simhei.ttf",
-            "simsun.ttc",
-            "NotoSerifSC-VF.ttf",
-            "simfang.ttf",
-            "simkai.ttf",
-            "simsunb.ttf",
-        ]
-    };
-    names.iter().map(|name| fonts_dir.join(name)).collect()
 }
 
 fn run_worker(
@@ -2587,10 +2868,15 @@ mod tests {
     fn reload_config_fields_updates_ui_values_and_status() {
         let path = unique_test_config_path("load-config");
         let mut config = test_config("load-config");
+        config.node.session_mode = SessionMode::Both;
+        config.node.role = NodeRole::Peer;
+        config.output.backend = OutputBackend::VirtualStub;
         config.node.listen_addr = "0.0.0.0:38101".to_owned();
         config.node.peer_addr = "192.168.1.22:38101".to_owned();
         config.audio.input_device = "default".to_owned();
-        config.output.target_device = "Speaker A".to_owned();
+        config.output.primary_target_device = "Speaker A".to_owned();
+        config.output.secondary_target_device = "Speaker B".to_owned();
+        config.output.routing = OutputRoutingMode::SplitLocalPeer;
         config.output.monitor_processed_output = false;
         config.cancel.step_size = 0.08;
         config.cancel.update_threshold = 0.41;
@@ -2611,8 +2897,12 @@ mod tests {
 
         assert_eq!(app.listen_addr_value, "0.0.0.0:38101");
         assert_eq!(app.peer_addr_value, "192.168.1.22:38101");
+        assert_eq!(app.session_mode_value, SessionMode::Both);
+        assert_eq!(app.role_value, NodeRole::Peer);
         assert_eq!(app.input_device_value, "default");
         assert_eq!(app.target_device_value, "Speaker A");
+        assert_eq!(app.secondary_target_device_value, "Speaker B");
+        assert_eq!(app.output_routing_value, OutputRoutingMode::SplitLocalPeer);
         assert!(!app.monitor_processed_output_value);
         assert!((app.cancel_step_size_value - 0.08).abs() < f32::EPSILON);
         assert!((app.cancel_update_threshold_value - 0.41).abs() < f32::EPSILON);
@@ -2653,8 +2943,12 @@ mod tests {
         let mut app = test_app(path.as_path());
         app.listen_addr_value = " 0.0.0.0:39001 ".to_owned();
         app.peer_addr_value = " 192.168.1.22 ".to_owned();
+        app.session_mode_value = SessionMode::MasterSlave;
+        app.role_value = NodeRole::Slave;
         app.input_device_value = " default ".to_owned();
         app.target_device_value = " Speaker B ".to_owned();
+        app.secondary_target_device_value = " Speaker C ".to_owned();
+        app.output_routing_value = OutputRoutingMode::Off;
         app.monitor_processed_output_value = false;
         app.cancel_step_size_value = 0.09;
         app.cancel_update_threshold_value = 0.37;
@@ -2673,8 +2967,12 @@ mod tests {
         let reloaded = load_config(&path).expect("persisted config should reload");
         assert_eq!(reloaded.node.listen_addr, "0.0.0.0:39001");
         assert_eq!(reloaded.node.peer_addr, "192.168.1.22:38002");
+        assert_eq!(reloaded.node.session_mode, SessionMode::MasterSlave);
+        assert_eq!(reloaded.node.role, NodeRole::Slave);
         assert_eq!(reloaded.audio.input_device, "default");
-        assert_eq!(reloaded.output.target_device, "Speaker B");
+        assert_eq!(reloaded.output.primary_target_device, "Speaker B");
+        assert_eq!(reloaded.output.secondary_target_device, "Speaker C");
+        assert_eq!(reloaded.output.routing, OutputRoutingMode::Off);
         assert!(!reloaded.output.monitor_processed_output);
         assert!((reloaded.cancel.step_size - 0.09).abs() < f32::EPSILON);
         assert!((reloaded.cancel.update_threshold - 0.37).abs() < f32::EPSILON);
@@ -2828,6 +3126,18 @@ mod tests {
     }
 
     #[test]
+    fn load_peer_variant_preset_updates_mode_and_routing() {
+        let path = unique_test_config_path("peer-variant");
+        let mut app = test_app(path.as_path());
+        app.load_peer_variant_preset(SessionMode::Both, OutputRoutingMode::MixToPrimary);
+
+        assert_eq!(app.config_path, "configs/peer.toml");
+        assert_eq!(app.session_mode_value, SessionMode::Both);
+        assert_eq!(app.role_value, NodeRole::Peer);
+        assert_eq!(app.output_routing_value, OutputRoutingMode::MixToPrimary);
+    }
+
+    #[test]
     fn metrics_panel_size_defaults_to_small_four_up_layout() {
         let path = unique_test_config_path("metrics-layout");
         let app = test_app(path.as_path());
@@ -2846,7 +3156,49 @@ mod tests {
         assert_eq!(app.language, UiLanguage::Chinese);
         assert_eq!(app.ui_text("Start", "启动"), "启动");
         assert_eq!(localized(UiLanguage::Chinese, "Language", "语言"), "语言");
-        assert_eq!(MetricsPanelSize::Compact.label(UiLanguage::Chinese), "小");
+        assert_eq!(MetricsPanelSize::Minimal.label(UiLanguage::Chinese), "极简");
+        assert_eq!(MetricsPanelSize::Compact.label(UiLanguage::Chinese), "默认");
+        assert_eq!(MetricsPanelSize::Medium.label(UiLanguage::Chinese), "大");
+        assert_eq!(MetricsPanelSize::Large.label(UiLanguage::Chinese), "我瞎了");
+    }
+
+    #[test]
+    fn minimal_metrics_dashboard_renders_without_visual_charts() {
+        let path = unique_test_config_path("metrics-minimal");
+        let mut app = test_app(path.as_path());
+        app.metrics_panel_size = MetricsPanelSize::Minimal;
+
+        let mut snapshot = RuntimeSnapshot::default();
+        snapshot.node_name = "minimal".to_owned();
+        snapshot.input_rms = 0.12;
+        snapshot.output_rms = 0.03;
+        snapshot.estimated_crosstalk_rms = 0.04;
+        snapshot.transport_loss_rate = 0.1;
+        snapshot.processing_time_us = 900;
+        snapshot.sent_packets = 42;
+        snapshot.received_packets = 40;
+        snapshot.concealed_packets = 2;
+        app.record_snapshot(snapshot);
+
+        let ctx = egui::Context::default();
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+
+        let _ = ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.draw_metrics_dashboard(
+                    ui,
+                    app.latest
+                        .as_ref()
+                        .expect("minimal metrics render test should have a snapshot"),
+                );
+            });
+        });
     }
 
     #[test]
@@ -2891,8 +3243,12 @@ mod tests {
             render_devices: Vec::new(),
             listen_addr_value: String::new(),
             peer_addr_value: String::new(),
+            session_mode_value: SessionMode::Peer,
+            role_value: NodeRole::Peer,
             input_device_value: String::new(),
             target_device_value: String::new(),
+            secondary_target_device_value: String::new(),
+            output_routing_value: OutputRoutingMode::LocalOnly,
             monitor_processed_output_value: true,
             cancel_step_size_value: 0.06,
             cancel_update_threshold_value: 0.48,
@@ -2958,12 +3314,7 @@ mod tests {
         let _ = render_noise_controls_frame(ctx, app, events);
     }
 
-    fn drag_pointer(
-        ctx: &egui::Context,
-        app: &mut NodeGuiApp,
-        start: egui::Pos2,
-        end: egui::Pos2,
-    ) {
+    fn drag_pointer(ctx: &egui::Context, app: &mut NodeGuiApp, start: egui::Pos2, end: egui::Pos2) {
         let _ = render_noise_controls_frame(
             ctx,
             app,
