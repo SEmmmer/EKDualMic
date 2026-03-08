@@ -32,4 +32,5 @@ tracing-subscriber.workspace = true
 [target.'cfg(windows)'.dependencies]
 eframe.workspace = true
 egui.workspace = true
+rfd = "0.15"
 
