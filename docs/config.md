@@ -5,9 +5,18 @@
 ## `[node]`
 
 - `name`: 节点名
+- `session_mode`: `master_slave` / `peer` / `both`
+- `role`: `master` / `slave` / `peer`
 - `listen_addr`: 本地监听地址；当 `transport_backend = "udp"` 时，当前要求写成显式 `IP:port`
 - `peer_addr`: 对端地址；当 `transport_backend = "udp"` 时，当前要求写成显式 `IP:port`
 - `transport_backend`: `udp` / `mock`
+
+配对规则：
+
+- `master_slave` 模式只允许 `master <-> slave`
+- `peer` 模式只允许 `peer <-> peer`
+- `both` 模式只允许 `peer <-> peer`
+- 当前运行时会把本端身份写进 UDP 包头，并在接收端严格校验对端身份；错误配对会直接报错，而不是静默继续运行
 
 双机局域网推荐写法：
 
@@ -27,9 +36,22 @@
 ## `[output]`
 
 - `backend`: `virtual_stub` / `wav_dump` / `null`
-- `target_device`: 当 `backend = "virtual_stub"` 且运行在 Windows 上时，支持写 render endpoint 的 friendly name，也支持写 `"default"` 选择当前默认输出设备；如果目标是外部虚拟声卡的输入端点（例如 VB-Cable 的 `CABLE Input`），处理后音频会被桥接过去
+- `primary_target_device`: 主输出设备；当 `backend = "virtual_stub"` 且运行在 Windows 上时，支持写 render endpoint 的 friendly name，也支持写 `"default"`
+- `secondary_target_device`: 第二输出设备；仅在 `routing = "split_local_peer"` 时使用
+- `routing`:
+  - `local_only`: 只输出本地处理后声音
+  - `off`: 不输出
+  - `mix_to_primary`: 把本地处理后声音和对端处理后声音混音到主输出设备
+  - `split_local_peer`: 本地处理后声音走主输出，对端处理后声音走第二输出
 - `monitor_processed_output`: 当 `backend = "virtual_stub"` 时，`true` 表示实时监听处理后的 `output_frame`，`false` 表示监听原始 `capture_raw`；当前默认 `true`
 - `wav_path`: 当 `backend = "wav_dump"` 时使用；`virtual_stub` 不会写这个路径
+
+路由限制：
+
+- `master` 只允许 `mix_to_primary` 或 `split_local_peer`
+- `slave` 只允许 `local_only` 或 `off`
+- `peer` + `session_mode = "peer"` 只允许 `local_only`
+- `peer` + `session_mode = "both"` 只允许 `mix_to_primary` 或 `split_local_peer`
 
 ## `[sync]`
 

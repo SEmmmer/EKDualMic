@@ -945,3 +945,96 @@
 
 - `cargo test -p app`
 - `cargo build --workspace --release`
+
+### 2026-03-08（将传输丢失改成 2400 帧滑动窗口）
+
+- 根据最新反馈，`transport_loss_rate` 之前使用的是累计统计口径，不是最近窗口，因此在长时间运行后会变得不够敏感。
+- 现在 `crates/common_types/src/lib.rs`、`crates/audio_transport/src/lib.rs` 和 `crates/app/src/runtime.rs` 已改成按最近 `2400` 个传输帧计算 `transport_loss_rate`。
+- GUI 的 metrics 历史窗口仍然保持 `240` 个 runtime snapshot，不和 transport loss 的统计窗口混在一起；`crates/app/src/gui.rs` 的传输面板也新增了文字说明，明确“丢失率按最近 2400 帧计算，图表仍只画最近 240 个快照”。
+
+验证：
+
+- `cargo test -p audio_transport`
+- `cargo test -p app`
+- `cargo test --workspace`
+
+### 2026-03-08（切换到 master/slave/peer 预设与严格配对模式）
+
+- 配置模型已从旧的 `node-a/node-b` 入口扩展成显式模式：
+  - `node.session_mode = master_slave / peer / both`
+  - `node.role = master / slave / peer`
+- 当前用户入口预设已切成三个文件：
+  - `configs/master.toml`
+  - `configs/slave.toml`
+  - `configs/peer.toml`
+  其中 `peer.toml` 默认是 `peer/peer`；如需 `both/both`，把 `session_mode` 改成 `both` 即可。
+- `audio_transport` 现在会把本端 `session_mode + role` 编码进 UDP 包头，并在接收端严格校验对端身份：
+  - `master` 只能接 `slave`
+  - `slave` 只能接 `master`
+  - `peer + peer` 只能接 `peer + peer`
+  - `peer + both` 只能接 `peer + both`
+  错误配对不再静默运行，而会直接报不兼容错误。
+- `runtime` 现在同时产出两路处理后流：
+  - `local_processed`
+  - `peer_processed`
+  这让新的输出路由可以工作。
+- 输出路由已扩展为：
+  - `local_only`
+  - `off`
+  - `mix_to_primary`
+  - `split_local_peer`
+- 路由限制已纳入配置校验：
+  - `master` 只允许 `mix_to_primary` / `split_local_peer`
+  - `slave` 只允许 `local_only` / `off`
+  - `peer/peer` 只允许 `local_only`
+  - `both/both` 只允许 `mix_to_primary` / `split_local_peer`
+- GUI 左侧现在也能直接编辑 `Session Mode`、`Role`、`Output Routing`、`Primary Output Device` 和 `Secondary Output Device`，并跟随现有保存 / reload 流程一起落盘。
+
+验证：
+
+- `cargo test -p audio_transport`
+- `cargo test -p app`
+- `cargo test --workspace`
+- `cargo build --workspace --release`
+
+关键结果：
+
+- 新的三预设和模式/角色/路由字段已经贯通到配置、transport、runtime 和 GUI。
+- 现在 master/slave、peer/peer、both/both 的限制不是只靠文档说明，而是真正在运行时被强校验。
+
+### 2026-03-08（Realtime Metrics 改成极简 / 默认 / 大 / 我瞎了四档）
+
+- 根据最新 GUI 反馈，把 `crates/app/src/gui.rs` 中原来的 `Metrics Size` 三档切换改成了四档：
+  - `极简`
+  - `默认`
+  - `大`
+  - `我瞎了`
+- 标题旁的静态提示文案也从较重的 `指标尺寸` 收成了淡色的 `尺寸`，只作为说明文本，不再显得像可点击控件。
+- 档位映射现在是：
+  - `默认` = 之前的小尺寸四列布局
+  - `大` = 之前的中尺寸两列布局
+  - `我瞎了` = 之前的大尺寸单列布局
+  - `极简` = 新增纯文字摘要模式，不显示折线图和进度条
+- `draw_metrics_dashboard` 现在会在 `极简` 档切到专门的文字摘要渲染路径，只保留概览、音频电平、同步/VAD、传输/耗时四块文本数据，避免继续用可视化图表占空间。
+- 对应的 GUI 测试也已经补上，确认：
+  - 默认启动仍是原来的四列小尺寸布局
+  - 中文标签已更新为 `极简 / 默认 / 大 / 我瞎了`
+  - `极简` 档可以正常渲染
+
+验证：
+
+- `cargo test -p app`
+- `cargo build --workspace --release`
+
+### 2026-03-08（配置文件下拉自动装载与内嵌思源黑体）
+
+- 按最新 GUI 反馈，把左侧原来的 `Config Path` 文本框和 `Load Config` / `刷新配置` 按钮收掉了，改成单一的 `配置文件` 下拉选择。
+- 现在在 `crates/app/src/gui.rs` 中，用户一旦切换预设项，就会立刻调用现有的 `load_selected_config_path()` 路径自动装载配置；不再需要额外再点一次“加载配置”。
+- `Import Config Folder` 仍然保留，用于把外部 config 文件夹批量导入到当前预设列表；导入完成后列表会自动刷新，并把首个新导入项装载到表单里。
+- 字体策略也按最新要求改回“内嵌”而不是“读系统字体”：`crates/app/src/gui.rs` 现在直接通过 `include_bytes!` 把 `assets/fonts/SourceHanSansCN-Regular.otf` 和 `assets/fonts/SourceHanSansCN-Bold.otf` 编进二进制。
+- 默认界面文本统一走思源黑体 regular，`Start` 按钮继续单独走 bold；这样 `app.exe` 不再依赖目标机器的 `C:\Windows\Fonts` 是否刚好装有对应字体。
+
+验证：
+
+- `cargo test -p app`
+- `cargo build --workspace --release`

@@ -5,6 +5,8 @@
 - 可完成的测试：编译、GUI 外壳、mock 离线验证、mock GUI 运行、真实 WASAPI 采集 + WAV 落盘、写入现有 render endpoint 的输出桥接
 - 尚未完成的测试：仓库内自带的系统级虚拟麦设备创建、真实双机端到端联调
 
+注意：当前用户入口预设已经切到 `configs/master.toml`、`configs/slave.toml`、`configs/peer.toml`。如果本文后续还有旧的 `node-a/node-b` 路径示例，应优先按新三预设理解，并把 `peer.toml` 的 `session_mode` 在 `peer` / `both` 之间切换。
+
 ## Read First
 
 测试前先读：
@@ -18,17 +20,15 @@
 ## Current Reality
 
 - Windows GUI 可以启动
-- 默认 `configs/node-a.toml` / `configs/node-b.toml` 仍指向 `wasapi` + `virtual_stub`
+- 默认 `configs/master.toml` / `configs/slave.toml` / `configs/peer.toml` 都指向 `wasapi` + `virtual_stub`
 - `audio_capture` 的 `wasapi` 后端已经实现固定 `48 kHz` / `mono` / `float32` / `10 ms` 的 shared-mode 采集 MVP
-- 当前推荐的真实采集验证配置是 `configs/node-a-wasapi-wav.toml`
 - `audio_output` 的 `virtual_stub` 在 Windows 上已不再是空实现；它现在会把处理后音频写到现有 render endpoint
 - 如果把 `target_device` 指向外部虚拟声卡的输入端点，例如 `CABLE Input`，处理后音频可以被桥接到那条现有虚拟麦链路
 - 仓库仍然不会自己创建新的系统级 capture endpoint，所以“完全内建的虚拟麦设备”仍未完成
-- 当前推荐的输出桥接验证配置是 `configs/node-a-mock-render.toml`
 - GUI worker 现在会在配置加载失败、runtime 初始化失败或运行中音频 I/O 失败后进入 `Recovering: ...` 状态，并定期重试
 - 运行中的 GUI 现在支持 `Reload Runtime`；如果先修改设备、网络字段或 `Noise Reduction` 区的降噪参数再点 `Save Runtime Fields` / `Apply Noise Controls`，会在保存 TOML 后自动请求 reload，无需关闭应用
 - GUI 现在也支持直接编辑 `listen_addr` / `peer_addr`；双机局域网场景不必再手改 TOML
-- 未修改的 `configs/node-a.toml` / `configs/node-b.toml` 仍包含占位输入设备名；如果本机不存在该名字，启动时报“找不到配置的 capture device”属于正常现象，不应误记成回归
+- `master/slave/peer` 三个预设都支持通过 GUI 直接改 `session_mode` / `role` / `output routing`
 
 ## Environment Checklist
 
@@ -163,19 +163,19 @@ cargo run -p app --release
 - GUI 窗口可以打开
 - 顶部应为菜单栏，而不只是静态标题；其中至少应有 `Language` / `语言` 菜单，且当前默认应显示中文界面
 - 菜单中应可切换 `English` 和 `中文`
-- 可编辑配置路径
-- 即使仓库外部没有单独的 `configs/` 目录，`Load Config` 下拉中也应能看到内置预设
+- 左侧应为 `配置文件` 下拉，而不是可编辑路径输入框
+- 即使仓库外部没有单独的 `configs/` 目录，`配置文件` 下拉中也应能看到内置预设
 - 左侧应能显示 `Capture Devices` / `Render Devices` 列表，并标记默认设备
 - 中文设备名和中文文案不应再显示为方块/乱码
 - 左侧的 `Audio Input Device` / `Output Target Device` 应为下拉菜单，而不是纯文本输入框
 - 左侧应能显示 `Local Listen Address` / `Peer Address` 可编辑字段
-- `Load Config` 应为下拉菜单，并列出 `configs/` 下已发现的 TOML 预设
+- `配置文件` 应为下拉菜单，并列出 `configs/` 下已发现的 TOML 预设
 - 应可通过 `Import Config Folder` 打开 Windows 文件夹选择界面；只选择一个 config 文件夹，就应能把其中的 `.toml` 批量导入到当前预设列表
 - 完全相同内容的配置文件不应被重复导入
 - 若出现同名但内容不同的配置，GUI 应先弹出警告；确认后自动重命名为 `name-1.toml`、`name-2.toml` 这样的形式，而不是 `name-1-1.toml`
-- 应可通过 `Load Config` 读出当前配置中的设备字段和网络字段，并通过 `Save Runtime Fields` 写回 TOML
+- 选择 `配置文件` 下拉项后，应自动读出当前配置中的设备字段和网络字段，并可通过 `Save Runtime Fields` 写回 TOML
 - `Noise Reduction` 区应能看到处理后监听、反向波和残余抑制相关的滑块 / 开关；调整后点击 `Apply Noise Controls` 应把参数写回当前 TOML
-- 点击 `Load Config` 后，状态栏和配置反馈应明确显示已从哪个路径装入配置
+- 切换 `配置文件` 下拉后，状态栏和配置反馈应明确显示已从哪个路径装入配置
 - 即使未先点 `Save Runtime Fields`，点击 `Start` 也应先把当前界面中的设备字段和网络字段同步进配置，再启动 runtime
 - 若当前目录没有对应的 `configs/*.toml`，首次 `Save Runtime Fields` 后应自动创建 `configs/` 并把配置写出
 - 左侧控制面板和 `Realtime Metrics` 面板都应支持鼠标滚轮滚动
@@ -184,7 +184,7 @@ cargo run -p app --release
 - runtime 运行中应可看到 `Reload Runtime` 按钮
 - 中央区域应能切换 `Metrics` / `Recording Test` 两个 tab
 - `Realtime Metrics` 不应再只是纯文本表格；应能看到状态卡、历史折线图和关键指标进度条
-- `Realtime Metrics` 标题旁应能看到 `Metrics Size` 按钮组；默认 `Small` 模式下一行应显示 4 个指标面板
+- `Realtime Metrics` 标题旁应能看到淡色的 `尺寸` 标签和 `极简 / 默认 / 大 / 我瞎了` 四档切换；默认 `默认` 模式下一行应显示 4 个指标面板，`极简` 模式不应显示图表和进度条
 - 指标面板与开始/停止按钮可见
 - GUI 启动后，仓库根目录 `logs/` 下应出现新的 `app-<pid>-<timestamp>.log`
 - GUI 中出现的关键状态变化，例如 `Config load failed`、`Recovering: ...`、`Reload requested`，也应同步写入最新日志文件
